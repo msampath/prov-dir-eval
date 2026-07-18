@@ -1,0 +1,1063 @@
+# ---------------------------------------------------------------------------
+# Runtime endpoint manifest for prov-dir-eval.
+#
+# This is the AUTHORITATIVE runtime source (config.py loads it). It is curated
+# from `provider_directory_endpoints.csv` (the human inventory tracker) plus the
+# confirmed endpoint table in PROJECT_STATUS.md, and adds runtime-only fields
+# the CSV does not carry: auth strategy, the .env secret keys each endpoint
+# needs, known server quirks, and pagination limits.
+#
+# One entry per DISTINCT base URL. `brands` lists every payer the URL serves.
+#
+# auth.strategy values map to provdir.auth strategies:
+#   none | client_id_header | client_id_secret_headers | api_key_header
+#   | oauth2_client_credentials | healthsparq_public_token
+#
+# `mvp: true` marks the 7 fully-open endpoints used for the credential-free
+# MVP vertical slice.
+#
+# `resource_subset`: omit (or null) => all 8 Plan-Net resources expected.
+# ---------------------------------------------------------------------------
+
+meta:
+  ig_version: "1.2.0"
+  fhir_version: "4.0.1"
+  plannet_resources:
+    - Organization
+    - Practitioner
+    - PractitionerRole
+    - Location
+    - HealthcareService
+    - OrganizationAffiliation
+    - InsurancePlan
+    - Endpoint
+
+endpoints:
+  # ----- Fully-open MVP subset (no credentials) ----------------------------
+  - key: humana
+    payer_name: Humana
+    parent_org: Humana
+    brands: [Humana]
+    base_url: https://fhir.humana.com/api
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    fhir_version: "4.0.1"
+    ig_version: "1.1.0"
+    quirks:
+      # Humana's edge is Akamai-fronted and rate-blocks high request volume
+      # (2026-07-08: a concurrency-10 id_chain tripped an IP-wide 403; see
+      # docs/evidence/humana_akamai_rate_block.md). Throttle all Humana traffic.
+      max_concurrency: 2
+      min_request_interval: 0.5
+      # Bare search caps at 500k/resource (per-search pagination ceiling), but
+      # filtered searches each page fully. Partition past the cap. Honored params:
+      # Practitioner=family, Organization=name, Location=address-state.
+      # PractitionerRole: reverse-reference id_chain on the practitioner ids we
+      # already hold. Probe 2026-07-08: PractitionerRole?practitioner=<id> pages
+      # fully and _summary=count works per id (sample prac -> 16 roles, 1 page);
+      # sidesteps the bare 500k cap and the un-partitionable specialty/calendar
+      # sweep. Coverage bounded by loaded practitioners (a measured residual:
+      # roles of practitioners we never landed are unreachable).
+      # Practitioner: daterange sweep (closed-key => no a-z0-9 charset residual).
+      # Probe 2026-07-06 (docs/evidence/humana_lastupdated_probe.md): counts work
+      # at <=1y widths and the 2026 mass is spread (max cluster ~320k < 500k cap);
+      # wide-window counts time out -> blind bisection handles them. Start 2020:
+      # year counts show effectively all records are 2024+.
+      # PractitionerRole: _summary=count times out at EVERY width (even 1 day) ->
+      # daterange not viable; needs a count-free calendar-window mode (pending).
+      # start 2024-01-01: probe 2026-07-06 showed 2024+2025+2026 counts already
+      # sum to ~961k > the 853k bare total, so pre-2024 is effectively empty and
+      # only costs 60s count-timeouts to blind-drill. 2024+ == the current active
+      # directory (scope: active/current, not historical archive).
+      adaptive:
+        Practitioner: {param: _lastUpdated, mode: daterange, start: "2024-01-01", bucket_max: 100000}
+        Organization: {param: name, mode: prefix, bucket_max: 100000}
+        Location: {param: address-state, mode: values, bucket_max: 100000}
+        # OR-batch practitioner ids (comma = OR, VERIFIED 2026-07-08: practitioner=
+        # id1,id2 -> total 32). Humana caps page size at ~100 regardless of _count,
+        # and a wide OR + big _count 502s the (flaky) origin: batch 100/_count 1000
+        # 502'd every try; batch 50/_count 100 returns 200. So keep queries light:
+        # batch 50, _count 100, concurrency 2 (throttled above). Transient 502s are
+        # retried by the client; re-run to backfill any batches that exhaust retries.
+        PractitionerRole: {mode: id_chain, chain_param: practitioner, source_table: practitioner, chain_batch: 50, chain_count: 100, chain_concurrency: 2}
+
+  - key: capital_blue
+    payer_name: Capital Blue Cross
+    parent_org: Capital Blue Cross
+    brands: [Capital Blue Cross]
+    base_url: https://providerdirectory-api.capbluecross.com/r4
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    quirks:
+      # Filter-only server: bare search is rejected, and PractitionerRole/
+      # OrganizationAffiliation have no name/state to partition by. A wide
+      # `_lastUpdated=ge2000` filter both satisfies the "valid search parameter"
+      # requirement AND matches every record; pagination works (unlike Premera),
+      # so a single match-all filter + normal paging retrieves the full set
+      # (PractitionerRole total ~2.2M). (values-mode with one value = match-all.)
+      # daterange (probe 2026-07-07): a single match-all _lastUpdated filter
+      # paginates but the server caps that one search — roles dead-ended at 1.61M
+      # of 2.24M (72%), OrgAff at 31k of 562k (5.6%). Timestamps are well-spread
+      # (2024/2025/2026 windows differ, sub-bisect cleanly), so time-bisection
+      # gives each window its own pagination and recovers past the per-search cap.
+      # Window-sum is the honest coverage denominator (bare count is rejected here).
+      # start 2000: CB counts work at every width (empty old windows count 0 and
+      # prune fast), so no reason to risk missing pre-2015 records + undercounting
+      # the window-sum denominator.
+      adaptive:
+        PractitionerRole: {param: _lastUpdated, mode: daterange, bucket_max: 100000}
+        # bucket_max 20k: at 100k, orgaff windows exceeded the server's per-search
+        # pagination cap and capped at 78%; smaller windows page fully.
+        OrganizationAffiliation: {param: _lastUpdated, mode: daterange, bucket_max: 20000}
+
+  - key: excellus
+    payer_name: Excellus BlueCross BlueShield
+    parent_org: Excellus
+    brands: [Excellus BCBS]
+    base_url: https://fhir.excellusbcbs.com/fhir/api
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    quirks:
+      page_size: 25   # Excellus caps results at 25/request
+      # PractitionerRole is filter-only: rejects bare/broad/_revinclude searches
+      # (all 400 — _revinclude declared but NOT honored, probed 2026-07-07). The
+      # ONLY working path is chaining on a known id: PractitionerRole?practitioner=<id>.
+      # Harvest by chaining every loaded Practitioner id. Bounded by practitioner
+      # coverage (~25k loaded). OrganizationAffiliation has NO working chain param
+      # (all 400) -> genuinely unretrievable, left at 0 (documented).
+      adaptive:
+        PractitionerRole: {mode: id_chain, chain_param: practitioner, source_table: practitioner}
+
+  - key: bcbs_ks
+    payer_name: BCBS Kansas
+    parent_org: BCBS Kansas
+    brands: [Blue Cross and Blue Shield of Kansas]
+    base_url: https://api.secure.bcbsks.com/bcbsks/fhir-prov-dire/api/v4
+    status: known
+    mvp: false
+    auth:
+      # Live test (2026-06-14): Cloudflare-fronted Azure APIM. WWW-Authenticate
+      # demands an Ocp-Apim-Subscription-Key header. NOT open (PROJECT_STATUS
+      # listed it as "None" auth; corrected here).
+      strategy: api_key_header
+      header_name: Ocp-Apim-Subscription-Key
+      secret_keys: [BCBSKS_SUBSCRIPTION_KEY]
+
+  - key: bcbs_mn
+    payer_name: BCBS Minnesota
+    parent_org: BCBS Minnesota
+    brands: [Blue Cross and Blue Shield of Minnesota]
+    base_url: https://api.bluecrossmn.com/fhir/provider
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+
+  - key: premera
+    payer_name: Premera Blue Cross
+    parent_org: Premera (via Opala)
+    brands: [Premera Blue Cross]
+    base_url: https://opala.tech/provdir/premera/v1/fhir-r4
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    quirks:
+      # ~50k practitioners paginated via opaque ?q= tokens; _count=1000 pages
+      # are slow to generate and time out. Smaller pages are faster/stabler.
+      page_size: 250
+      # Bundle.link[next] dead-ends (page 2 empty), and large pages time out — but
+      # SMALL filtered buckets return their full set on page 1, fast (proven:
+      # family=aa -> 20 rows in 4.8s; family=smith=290 -> timeout). So adaptively
+      # subdivide name-bearing resources to <=50/bucket and take page 1 only.
+      # (PractitionerRole/OrganizationAffiliation lack a prefix param -> not reachable.)
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 50, page1_only: true}
+        Organization: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
+        Location: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
+        HealthcareService: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
+
+  - key: banner
+    payer_name: Banner Health
+    parent_org: Banner Health (payvider, via Innovaccer)
+    brands: [Banner Health]
+    base_url: https://bannerhealth-live.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    quirks:
+      # Live test (2026-06-14): Innovaccer gateway does not register /metadata
+      # (returns 403 {"msg":"Route Not Registered"}); Practitioner?_count=1 -> 200.
+      # Liveness is confirmed by probing a resource instead of /metadata.
+      no_metadata: true
+      page_size: 1000
+      # Bundle.link[next] points at an auth-gated /fhirwrapper/ path (401);
+      # rewriting it back to /fhir/ restores public pagination.
+      next_link_replace: ["/fhirwrapper/", "/fhir/"]
+
+  - key: mvphealthcare
+    payer_name: MVP Health Care
+    parent_org: MVP Health Care
+    brands: [MVP Health Care]
+    base_url: https://api.mvphealthcare.com/provdirfhirapi
+    status: known
+    mvp: false   # open + validated 2026-07-06; promote to a pull subset deliberately
+    auth:
+      strategy: none
+    quirks:
+      # InterSystems HealthShare (<HSFHIRErr> errors), Azure-fronted. Deep probe
+      # 2026-07-06 (docs/evidence/mvphealthcare_probe.md): open Plan-Net server,
+      # 8/8 resources; unfiltered search on big resources -> 413 "SearchTooCostly"
+      # (>50,000 results); queryId pagination WORKS (cursor advances); first page
+      # materializes the whole selection so BIG buckets time out -> keep partition
+      # buckets small. _lastUpdated counts time out -> daterange not usable.
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 5000}
+        Organization: {param: name, mode: prefix, bucket_max: 5000}
+        Location: {param: name, mode: prefix, bucket_max: 5000}
+        # Bare PractitionerRole search times out (SearchTooCostly), but the
+        # reference query works: id_chain on our loaded practitioner ids. Comma-OR
+        # verified 2026-07-09 (id0,id1 -> 3 = 2+1); batch 50 returns ~85 roles in
+        # one page, no timeout. ~200k practitioners x ~1.7 roles ~= 340k roles.
+        PractitionerRole: {mode: id_chain, chain_param: practitioner, source_table: practitioner, chain_batch: 50, chain_count: 100, chain_concurrency: 3}
+
+  - key: healthpartners
+    payer_name: HealthPartners
+    parent_org: HealthPartners
+    brands: [HealthPartners]
+    base_url: https://api-developerportal.healthpartners.com/interop/external/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      # Token URL pending from the developer portal. It is a GATEWAY OAuth
+      # provider (IBM API Connect app creds), NOT login.microsoftonline.com —
+      # AAD rejects these creds with AADSTS700016 (probe 2026-07-06, see
+      # docs/evidence/healthpartners_auth_probe.md). Data routes will likely
+      # also need X-IBM-Client-Id alongside the Bearer.
+      token_url: null
+      secret_keys: [HEALTHPARTNERS_CLIENT_ID, HEALTHPARTNERS_CLIENT_SECRET]
+    quirks:
+      # Plan is rate-limited to 100 requests/hour (dev tier 2026-07-06; prod
+      # upgrade requested). 37s spacing, single-file => ~97/h incl. retries.
+      min_request_interval: 37.0
+      max_concurrency: 1
+
+  # ----- Discovered open endpoints (2026-07-06, docs/endpoint_discovery.md) -
+  # Validated 2xx no-auth. mvp:false — promote to a pull subset deliberately.
+  - key: devoted
+    payer_name: Devoted Health
+    parent_org: Devoted Health
+    brands: [Devoted Health]
+    base_url: https://fhir.devoted.com/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: sharp_health_plan
+    payer_name: Sharp Health Plan
+    parent_org: Sharp HealthCare
+    brands: [Sharp Health Plan]
+    # SKIP (flagged 2026-07-06): this base serves /metadata but resources 404 —
+    # "/shpconformance/" is the CONFORMANCE endpoint, not the data endpoint. Real
+    # provider-data base URL unknown (needs discovery follow-up). Not pulled.
+    base_url: https://shp-apis.sharphealthplan.com/shpconformance/api
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: sentara
+    payer_name: Sentara Health Plans
+    parent_org: Sentara Health
+    brands: [Sentara Health Plans, Optima Health]
+    base_url: https://shpp.interop.sentara.com/shpp/api/plannet
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true   # /metadata 404; resource root serves data (discovery probe)
+
+  - key: hap
+    payer_name: Health Alliance Plan (HAP)
+    parent_org: Health Alliance Plan
+    brands: [HAP]
+    base_url: https://provider-directory-r4.api.hap.org
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      # See docs/evidence/hap_pagination_and_quota.md. Two findings:
+      # 1) next link -> 403ing host fhir-prov-dir-r4.api.hap.org (Banner-style);
+      #    the rewrite below fixes it (proven: cursor advances on public host).
+      # 2) WINDOWED REQUEST QUOTA (not a rate cap): sustained pulls 429 mid-stream;
+      #    ~5 pulls + probes in 20min depleted it. Config below is correct; the
+      #    remaining blocker is the depleted quota. REVISIT after >=1h with ONE
+      #    slow single-resource-at-a-time pass; do not hammer with full re-pulls.
+      # Burst limit confirmed (2026-07-07): spaced single requests 200, but ~5
+      # requests in ~2.5s (0.5s spacing) trip 429. NOT a daily quota. 5s spacing
+      # (~12/min) stays under it; slow but completes. Small directory (~360k).
+      max_concurrency: 1
+      min_request_interval: 5.0
+      next_link_replace: ["fhir-prov-dir-r4.api.hap.org", "provider-directory-r4.api.hap.org"]
+
+  - key: amerihealth_ncex
+    payer_name: AmeriHealth Caritas (NCEX plan)
+    parent_org: AmeriHealth Caritas
+    brands: [AmeriHealth Caritas]
+    # Multi-plan gateway: api-ext.amerihealthcaritas.com/{plan}/provider-api
+    # (confirmed plans NCEX, 1200). One entry per plan; NCEX is representative.
+    base_url: https://api-ext.amerihealthcaritas.com/NCEX/provider-api
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      # HUGE directory (probe 2026-07-06): bare Practitioner 5.71M / Org 2.18M;
+      # active=true 3.72M; _lastUpdated>=2026 = Pract 1.02M / Org 99,770. User
+      # (2026-07-06): scope AmeriHealth to 2026 to bound volume. NOTE: this is a
+      # per-payer exception to the "active flag" scope — cross-payer comparisons
+      # against AmeriHealth carry a 2026-only asterisk. base_params scopes both
+      # searches and the coverage count (honest %).
+      base_params: {_lastUpdated: "ge2026-01-01"}
+      # Even 2026-scoped, bare Practitioner caps ~654k of 1.02M and Location bare
+      # times out (794k). Partition (base_params 2026 merges into each bucket +
+      # its count, so coverage stays honest). Org/roles/etc. complete bare.
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+        Location: {param: address-state, mode: values, bucket_max: 100000}
+
+  - key: priority_health
+    payer_name: Priority Health
+    parent_org: Priority Health
+    brands: [Priority Health]
+    base_url: https://api.priorityfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route
+
+  - key: jhhp
+    payer_name: Johns Hopkins Health Plans (Priority Partners)
+    parent_org: Johns Hopkins HealthCare
+    brands: [Priority Partners, Johns Hopkins Advantage MD, US Family Health Plan]
+    base_url: https://api.jhhpfhir.com/r4/public-pp
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route
+
+  - key: navitus
+    payer_name: Navitus Health Solutions (PBM pharmacy directory)
+    parent_org: Navitus (PBM)
+    brands: [Navitus]
+    # SKIP (flagged 2026-07-06): PBM PHARMACY network, not a medical provider
+    # directory — out of scope for "active provider directory". Live/open but
+    # intentionally not pulled. Kept in manifest for the record.
+    base_url: https://opala.tech/provdir/navitus/v1/fhir-r4
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  # ----- Discovery round 2 (2026-07-07, docs/endpoint_discovery_round2.md) --
+  # 1upHealth public tenants (api.<slug>fhir.com/r4/public), all no-auth.
+  - key: oscar
+    payer_name: Oscar Health
+    parent_org: Oscar Health
+    brands: [Oscar Health]
+    base_url: https://api.oscarfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: advanced_health
+    payer_name: Advanced Health (OR CCO)
+    parent_org: Advanced Health
+    brands: [Advanced Health]
+    base_url: https://api.advancedhealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: network_health
+    payer_name: Network Health (WI)
+    parent_org: Network Health
+    brands: [Network Health]
+    base_url: https://api.networkhealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: ucare
+    payer_name: UCare (MN)
+    parent_org: UCare
+    brands: [UCare]
+    base_url: https://api.ucarefhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  - key: jhhp_advantage_md
+    payer_name: Johns Hopkins Advantage MD (Medicare Advantage)
+    parent_org: Johns Hopkins HealthCare
+    brands: [Johns Hopkins Advantage MD]
+    # 1up product-scoped public tenant: /r4/public-<product>. -ma = Advantage MD
+    # (distinct from jhhp's -pp Priority Partners). Confirmed 200 (round 3).
+    base_url: https://api.jhhpfhir.com/r4/public-ma
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+
+  # AmeriHealth Caritas Next (ACA-marketplace) state plans — same gateway/quirks
+  # as amerihealth_ncex: scope to 2026 (user), adaptive for Practitioner/Location.
+  - key: amerihealth_deex
+    payer_name: AmeriHealth Caritas Next — Delaware
+    parent_org: AmeriHealth Caritas
+    brands: [AmeriHealth Caritas Next DE]
+    base_url: https://api-ext.amerihealthcaritas.com/DEEX/provider-api
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      base_params: {_lastUpdated: "ge2026-01-01"}
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+        Location: {param: address-state, mode: values, bucket_max: 100000}
+
+  - key: amerihealth_flex
+    payer_name: AmeriHealth Caritas Next — Florida
+    parent_org: AmeriHealth Caritas
+    brands: [AmeriHealth Caritas Next FL]
+    base_url: https://api-ext.amerihealthcaritas.com/FLEX/provider-api
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      base_params: {_lastUpdated: "ge2026-01-01"}
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+        Location: {param: address-state, mode: values, bucket_max: 100000}
+
+  - key: amerihealth_laex
+    payer_name: AmeriHealth Caritas Next — Louisiana
+    parent_org: AmeriHealth Caritas
+    brands: [AmeriHealth Caritas Next LA]
+    base_url: https://api-ext.amerihealthcaritas.com/LAEX/provider-api
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      # LAEX is a SLOW server that also 5xx's under concurrent load (bucket fetch
+      # errors even at 120s timeouts). Gentle: single-file, generous timeouts,
+      # and SMALL prefix buckets (fewer pages each -> less to fail mid-sweep).
+      # Resumable, so each pass retries errored buckets. PractitionerRole stays
+      # bare (no partition dimension).
+      max_concurrency: 2
+      read_timeout: 120.0
+      request_timeout: 180.0
+      base_params: {_lastUpdated: "ge2026-01-01"}
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 25000}
+        Organization: {param: name, mode: prefix, bucket_max: 25000}
+        Location: {param: address-state, mode: values, bucket_max: 25000}
+
+  - key: amerihealth_scex
+    payer_name: AmeriHealth Caritas Next — South Carolina
+    parent_org: AmeriHealth Caritas
+    brands: [AmeriHealth Caritas Next SC]
+    base_url: https://api-ext.amerihealthcaritas.com/SCEX/provider-api
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      base_params: {_lastUpdated: "ge2026-01-01"}
+      adaptive:
+        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+        Location: {param: address-state, mode: values, bucket_max: 100000}
+
+  - key: wellmark
+    payer_name: Wellmark (BCBS Iowa / South Dakota)
+    parent_org: Wellmark
+    brands: [Wellmark Blue Cross Blue Shield, Blue Medicare Advantage]
+    base_url: https://wellmark.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      # Innovaccer Plan-Net route (like Banner/bcbs_az): no /metadata on the
+      # sub-path. Probed 2026-07-08: Organization count=204,183, bare pagination
+      # works, next links are clean page-based on the public host (NO /fhirwrapper
+      # rewrite needed, unlike Banner). _summary=count IS supported.
+      no_metadata: true
+      page_size: 1000
+
+  # ----- HealthSparq/Kyruus public-token cluster (2026-07-07) --------------
+  # Path recovered from the Swagger via /browse: a CENTRAL gateway
+  # (api-gateway.healthsparq.com/provider-fhir-service/v1/fhir) serves all
+  # tenants; a per-tenant PUBLIC token (no creds) from <tenant>fhir.healthsparq.com
+  # selects the tenant. Codes are public (in the manifest, not .env). CDPHP flow
+  # verified end-to-end: Org 61,728 / Pract 40,337 / roles 95,835.
+  - key: cdphp
+    payer_name: CDPHP (Capital District Physicians' Health Plan)
+    parent_org: CDPHP
+    brands: [CDPHP]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://cdphpfhir.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: CDPHP_I, brand_code: CDPHP, product_code: CDPHP}
+    quirks:
+      # HealthSparq caps page size at 100 and emits RELATIVE next links
+      # (/v1/fhir/...?_getpagesoffset=N) — rewrite to absolute so paging advances.
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+
+  - key: christus
+    payer_name: CHRISTUS Health Plan
+    parent_org: CHRISTUS Health
+    brands: [CHRISTUS Health Plan]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://christushealthplan.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: CHRISTUS_I, brand_code: CHRISTUS, product_code: CHRISTUS}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+
+  - key: quartz
+    payer_name: Quartz Health Solutions
+    parent_org: Quartz
+    brands: [Quartz]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://quartzfhir.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: QUARTZ_I, brand_code: QUARTZ, product_code: QUARTZ}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+
+  - key: hpn
+    payer_name: Health Plan of Nevada
+    parent_org: UnitedHealthcare / Sierra Health
+    brands: [Health Plan of Nevada]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://hsprov.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: HPNSHL_I, brand_code: HPNMED, product_code: UHCHPNMedicaid}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+
+  - key: mercycare
+    payer_name: MercyCare (Mercy Health Plan)
+    parent_org: Mercy
+    brands: [MercyCare]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://mercycarefhir.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: MERCYCARE_I, brand_code: MERCYCARE, product_code: MERCYCARE}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+
+  - key: regence
+    payer_name: Regence (BCBS OR/WA/UT/ID; Cambia)
+    parent_org: Cambia Health Solutions
+    brands: [Regence BlueCross BlueShield, Asuris, BridgeSpan]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    # Token via the SHARED hsprov host with Regence codes (verified: 330k orgs).
+    # Brand variants (Asuris/BridgeSpan/Cambia) reachable via different brandCodes
+    # — not yet added (need their codes; may overlap this RG set).
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://hsprov.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: RG_I, brand_code: RG, product_code: RG}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+      # Regence is HUGE (~18M) and its search params don't support prefix
+      # partitioning (family is EXACT match, _lastUpdated=0, address-state=400).
+      # Strategy = REFERENCE-GRAPH HARVEST (validated 2026-07-08):
+      #  * PractitionerRole via the specialty ValueSet (671 codes, required
+      #    binding -> exhaustive), small buckets that page fully.
+      #  * Practitioner/Location/HealthcareService have NO search partition, but
+      #    the /{Type}/{id} READ endpoint works and isn't paginated -> harvest
+      #    their ids from references we already hold and read each by id.
+      # Run order: roles first, then the id_read resources (they source from roles/
+      # orgaff/hcs). Re-run id_read to closure.
+      max_concurrency: 6
+      adaptive:
+        # `provdir harvest` uses this: sweep roles by specialty WITH _include to
+        # harvest roles + practitioners + locations + orgs + services in one pass.
+        PractitionerRole:
+          mode: values
+          param: specialty
+          values_ref: specialties
+          bucket_max: 100000
+          include: [PractitionerRole:practitioner, PractitionerRole:location, PractitionerRole:organization, PractitionerRole:service, PractitionerRole:network]
+        # id_read fallbacks (via `provdir etl`) for orphans not reached by roles.
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs], [organization_affiliation, location_refs], [healthcare_service, location_refs], [insurance_plan, coverage_area_refs]]
+        HealthcareService:
+          mode: id_read
+          ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]
+
+  # ----- MiHIN InterOp Station (api.interopstation.com/<tenant>/fhir) -------
+  # Multi-tenant AWS API Gateway; needs an x-api-key from the MiHIN third-party
+  # developer portal (probe 2026-07-08: {"message":"Forbidden"} = missing key).
+  # One key likely covers all tenants. Parked until MIHIN_API_KEY is in .env.
+  # Source: mihin.org InterOp Station Third-Party Developer Portal User Guide.
+  - key: mihin_bcbsm
+    payer_name: Blue Cross Blue Shield of Michigan
+    parent_org: BCBS Michigan (via MiHIN)
+    brands: [Blue Cross Blue Shield of Michigan]
+    base_url: https://api.interopstation.com/bcbsm/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+  - key: mihin_mhp
+    payer_name: McLaren Health Plan
+    parent_org: McLaren (via MiHIN)
+    brands: [McLaren Health Plan]
+    base_url: https://api.interopstation.com/mhp/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+  - key: mihin_mdw
+    payer_name: McLaren MDwise
+    parent_org: McLaren (via MiHIN)
+    brands: [McLaren MDwise]
+    base_url: https://api.interopstation.com/mdw/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+  - key: mihin_uphp
+    payer_name: Upper Peninsula Health Plan
+    parent_org: UPHP (via MiHIN)
+    brands: [Upper Peninsula Health Plan]
+    base_url: https://api.interopstation.com/uphp/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+  - key: mihin_mdhhs
+    payer_name: Michigan Dept of Health and Human Services (Medicaid)
+    parent_org: State of Michigan (via MiHIN)
+    brands: [Michigan Medicaid, MDHHS]
+    base_url: https://api.interopstation.com/mdhhs/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+  - key: mihin_njios
+    payer_name: New Jersey Medicaid / FamilyCare
+    parent_org: State of New Jersey (via MiHIN)
+    brands: [NJ Medicaid, NJ FamilyCare]
+    base_url: https://api.interopstation.com/njios/fhir
+    status: known
+    mvp: false
+    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+
+  # ----- Known endpoints requiring credentials -----------------------------
+  - key: uhc_optum
+    payer_name: UnitedHealthcare (Optum FLEX)
+    parent_org: UnitedHealth Group / Optum
+    brands: [UnitedHealthcare, Sierra Health and Life, Rocky Mountain Health Plans, People's Health]
+    base_url: https://flex.optum.com/fhirpublic/R4
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # public scopes need no auth
+    fhir_version: "4.0.1"
+    ig_version: "1.1.0"
+    quirks:
+      practitioner_requires_filter: true   # bare Practitioner search => 500
+      total_cap: 10000
+      default_practitioner_filter: "address-state=FL"
+      # Probed 2026-07-07: the 10,000 cap applies to _summary=count TOO (family=smith
+      # -> total=10000, impossible), so count-guided partitioning can't detect
+      # under-cap buckets and a fine prefix sweep would need ~tens of thousands of
+      # buckets. Full retrieval impractical; current data (~9.5k/resource) is a
+      # CAPPED SAMPLE. Documented limitation — no adaptive config attempted.
+
+  - key: elevance
+    payer_name: Anthem / Elevance (unregistered Medicaid mandate path)
+    parent_org: Elevance Health
+    brands:
+      - Anthem Blue Cross
+      - Anthem Blue Cross Blue Shield
+      - Amerigroup
+      - Blue Medicare Advantage
+      - Clear Health Alliance
+      - Dell Children Health Plan
+      - Healthy Blue
+      - Healthy Blue Blue Choice
+      - Healthy Blue NC
+      - Simply HealthCare
+      - Summit
+      - Unicare
+      - Wellpoint
+    base_url: https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd
+    status: unknown   # unregistered path serves /metadata but 500s on ALL resource searches
+    mvp: false
+    auth:
+      strategy: none
+    ig_version: "1.1.0"
+    # Probed 2026-07-07: /metadata 200, but Organization/Practitioner/etc. searches
+    # (bare AND filtered) all return HTTP 500 — the unregistered path publishes a
+    # CapabilityStatement but does not serve data. Registered path needs OAuth2
+    # (creds required). Not retrievable via the open path. status->unknown (excluded).
+
+  - key: hcsc
+    payer_name: HCSC (BCBS IL/TX/NM/OK/MT)
+    parent_org: Health Care Service Corporation
+    brands: [BCBS Illinois, BCBS Texas, BCBS New Mexico, BCBS Oklahoma, BCBS Montana]
+    # Base confirmed via the ProviderFinder RAML (v1.1.5): baseUri
+    # api.hcsc.net/providerfinder/ + v1 + /sapphire/fhir.
+    # BLOCKED at the edge (probed 2026-07-08 WITH valid issued credentials):
+    # api.hcsc.net is fronted by Akamai Bot Manager; every GET returns an
+    # identical Akamai 500 deny (errors.edgesuite.net) regardless of creds /
+    # header form / browser UA, so the ClientId never reaches the MuleSoft
+    # gateway. Not an auth/config problem — see docs/evidence/hcsc_access.md.
+    # Creds are in .env but a pull cannot succeed until HCSC unblocks API traffic.
+    base_url: https://api.hcsc.net/providerfinder/v1/sapphire/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: client_id_secret_headers
+      secret_keys: [HCSC_CLIENT_ID, HCSC_CLIENT_SECRET]
+    resource_subset:
+      - Organization
+      - Practitioner
+      - PractitionerRole
+      - Location
+      - OrganizationAffiliation
+      # omits InsurancePlan, HealthcareService, Endpoint
+    quirks:
+      # RAML-declared search params (VERIFY on first authenticated pull —
+      # declared != working): PractitionerRole{practitioner,organization,network,
+      # location,specialty}; Practitioner{family,given,name}; Organization{name};
+      # Location{name,address-city,address-state,address-postalcode};
+      # OrganizationAffiliation{specialty,network,location,primary-organization}.
+      # Pre-wired: roles via the specialty ValueSet (specialty is searchable);
+      # Practitioner via family prefix. Add _include to roles if honored.
+      adaptive:
+        PractitionerRole: {mode: values, param: specialty, values_ref: specialties, bucket_max: 100000}
+        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+
+  - key: florida_blue
+    payer_name: Florida Blue
+    parent_org: GuideWell / Florida Blue
+    brands: [Florida Blue]
+    base_url: https://api.bcbsfl.com/interop/R4
+    status: known
+    mvp: false
+    auth:
+      strategy: client_id_header
+      header_name: X-IBM-Client-ID
+      secret_keys: [BCBSFL_CLIENT_ID]
+
+  - key: aetna_cvs
+    payer_name: Aetna / CVS Health
+    parent_org: CVS Health
+    brands: [Aetna]
+    base_url: https://apix.cvshealth.com/providerdirectory/v1
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      token_url: null   # TODO: confirm at developer portal
+      secret_keys: [AETNA_CLIENT_ID, AETNA_CLIENT_SECRET]
+
+  - key: bcbs_sc
+    payer_name: BCBS South Carolina
+    parent_org: BCBS South Carolina
+    brands: [Blue Cross Blue Shield of South Carolina]
+    base_url: https://api.bcbssc.com/interoperability/provider-directory
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      token_url: null
+      secret_keys: [BCBSSC_CLIENT_ID, BCBSSC_CLIENT_SECRET]
+
+  - key: bcbs_al
+    payer_name: BCBS Alabama
+    parent_org: BCBS Alabama
+    brands: [Blue Cross and Blue Shield of Alabama]
+    base_url: https://fhirapi.bcbsal.org/fhir
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      token_url: null
+      secret_keys: [BCBSAL_CLIENT_ID, BCBSAL_CLIENT_SECRET]
+
+  - key: arkansas_bcbs
+    payer_name: Arkansas Blue Cross Blue Shield
+    parent_org: Arkansas BCBS
+    brands: [Arkansas Blue Cross and Blue Shield]
+    base_url: https://api.arkbluecross.com/blueware/V1/FHIR
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      token_url: null
+      secret_keys: [ARKBCBS_CLIENT_ID, ARKBCBS_CLIENT_SECRET]
+      # Provider dir endpoints require OAuth2 (401 Bearer, probed 2026-07-08);
+      # credentials only via manual email request + security questionnaire + T&C +
+      # EIS review + go-live (abcbs-prod-devportal.apigee.io). Approval-gated;
+      # not pursued. Evidence: docs/evidence/arkansas_bcbs_access.md
+
+  - key: bcbs_la
+    payer_name: BCBS Louisiana
+    parent_org: BCBS Louisiana (OnyxOS / SAFHIR)
+    brands: [Blue Cross and Blue Shield of Louisiana]
+    base_url: https://api-bcbs-prd.safhir.io/v1/api
+    status: known
+    mvp: false
+    auth:
+      strategy: oauth2_client_credentials
+      token_url: null
+      secret_keys: [BCBSLA_CLIENT_ID, BCBSLA_CLIENT_SECRET]
+
+  # ----- Base URL known, auth/specifics unconfirmed ------------------------
+  - key: cigna
+    payer_name: Cigna
+    parent_org: The Cigna Group
+    brands: [Cigna]
+    base_url: https://fhir.cigna.com/ProviderDirectory/v1
+    status: unknown   # auth requirements TBD
+    mvp: false
+    auth:
+      strategy: none   # provisional; verify at developer.cigna.com
+
+  - key: bcbs_az
+    payer_name: AZ Blue (Blue Cross Blue Shield of Arizona)
+    parent_org: AZ Blue (on Innovaccer)
+    brands: [AZ Blue, Blue Cross Blue Shield of Arizona]
+    # Live test (2026-06-14): the /api/fhir/r4 path 404s; the working base is the
+    # Innovaccer Plan-Net path (same pattern as Banner). Open + live.
+    base_url: https://azblue.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: true
+    auth:
+      strategy: none
+    quirks:
+      # /metadata returns 403 "Route Not Registered"; Organization?_count=1 -> 200.
+      no_metadata: true
+      page_size: 1000
+      # Bare Organization pagination caps ~1.5M of 1.86M served. name= and
+      # address-state= searches TIME OUT (can't partition on them), but
+      # _lastUpdated counts fast and subdivides cleanly (2024=1.54M, 2025=245k,
+      # 2026=81k; monthly windows small) -> daterange bisection past the cap.
+      adaptive:
+        Organization: {param: _lastUpdated, mode: daterange, start: "2024-01-01", bucket_max: 100000}
+
+  # ===== Discovery round 4 (2026-07-16) — new tenants =====
+  # 1upHealth public tenants (docs/endpoint_discovery_round4_1up.md)
+  - key: aultcare
+    payer_name: AultCare (OH)
+    parent_org: AultCare
+    brands: [AultCare]
+    base_url: https://api.aultcarefhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: fallon_health
+    payer_name: Fallon Health (MA)
+    parent_org: Fallon Health
+    brands: [Fallon Health]
+    base_url: https://api.fallonhealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: hpsm
+    payer_name: Health Plan of San Mateo (CA)
+    parent_org: Health Plan of San Mateo
+    brands: [Health Plan of San Mateo]
+    base_url: https://api.hpsmfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: alliant
+    payer_name: Alliant Health Plans (GA)
+    parent_org: Alliant Health Plans
+    brands: [Alliant Health Plans]
+    base_url: https://api.allianthealthplansfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: viva_health
+    payer_name: Viva Health (AL)
+    parent_org: Viva Health
+    brands: [Viva Health]
+    base_url: https://api.vivahealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: ahf
+    payer_name: AHF / Positive Healthcare (CA)
+    parent_org: AIDS Healthcare Foundation
+    brands: [AIDS Healthcare Foundation]
+    base_url: https://api.ahffhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: dean_1up
+    payer_name: Dean Health Plan (WI) — 1upHealth tenant
+    parent_org: Dean Health Plan
+    brands: [Dean Health Plan]
+    base_url: https://api.deanhealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: zing_health
+    payer_name: Zing Health (IL/MI)
+    parent_org: Zing Health
+    brands: [Zing Health]
+    base_url: https://api.zinghealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: vns_health
+    payer_name: VNS Health (NY)
+    parent_org: VNS Health
+    brands: [VNS Health]
+    base_url: https://api.vnshealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: healthteam
+    payer_name: HealthTeam Advantage (NC)
+    parent_org: HealthTeam Advantage
+    brands: [HealthTeam Advantage]
+    base_url: https://api.healthteamadvantagefhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  - key: western_health
+    payer_name: Western Health Advantage (CA)
+    parent_org: Western Health Advantage
+    brands: [Western Health Advantage]
+    base_url: https://api.westernhealthfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 4)
+  # HealthSparq/Kyruus (docs/endpoint_discovery_round4_healthsparq.md)
+  - key: medica
+    payer_name: Medica
+    parent_org: Medica
+    brands: [Medica]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    # Practitioner=0 via search; harvested via role.practitioner_ref id_read.
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://hsprov.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: MEDICA_I, brand_code: MEDICA, product_code: MEDICA}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+      # Same gateway/scale as Regence (~15-17M, page cap 100, no prefix partition):
+      # reference-graph harvest. `provdir harvest` sweeps roles by specialty ValueSet
+      # WITH _include; `provdir etl` then id_reads Practitioner/Location/HealthcareService
+      # from held references. Medica exposes Practitioner=0 via search -> practitioners
+      # come only from role.practitioner_ref id_read, which this covers.
+      max_concurrency: 6
+      adaptive:
+        PractitionerRole:
+          mode: values
+          param: specialty
+          values_ref: specialties
+          bucket_max: 100000
+          include: [PractitionerRole:practitioner, PractitionerRole:location, PractitionerRole:organization, PractitionerRole:service, PractitionerRole:network]
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs], [organization_affiliation, location_refs], [healthcare_service, location_refs], [insurance_plan, coverage_area_refs]]
+        HealthcareService:
+          mode: id_read
+          ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]
+  - key: dean_healthsparq
+    payer_name: Dean Health Plan (SSM Health / Medica)
+    parent_org: Medica
+    brands: [Dean Health Plan (SSM Health / Medica)]
+    base_url: https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    # dean.healthsparq.com does not resolve; mint via shared hsprov host.
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://hsprov.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: DEAN_I, brand_code: DEAN, product_code: DEAN}
+    quirks:
+      next_link_replace: ["/v1/fhir/", "https://api-gateway.healthsparq.com/provider-fhir-service/v1/fhir/"]
+      # Same gateway/scale as Regence (~15-17M, page cap 100, no prefix partition):
+      # reference-graph harvest. `provdir harvest` sweeps roles by specialty ValueSet
+      # WITH _include; `provdir etl` then id_reads Practitioner/Location/HealthcareService
+      # from held references. Medica exposes Practitioner=0 via search -> practitioners
+      # come only from role.practitioner_ref id_read, which this covers.
+      max_concurrency: 6
+      adaptive:
+        PractitionerRole:
+          mode: values
+          param: specialty
+          values_ref: specialties
+          bucket_max: 100000
+          include: [PractitionerRole:practitioner, PractitionerRole:location, PractitionerRole:organization, PractitionerRole:service, PractitionerRole:network]
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs], [organization_affiliation, location_refs], [healthcare_service, location_refs], [insurance_plan, coverage_area_refs]]
+        HealthcareService:
+          mode: id_read
+          ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]

@@ -1,0 +1,32 @@
+# Secrets & local config
+.env
+.env.local
+
+# User-provided reference data (IG capability statement, CMS standards)
+reference/
+
+# Generated outputs (reports, logs, site, snapshots)
+output/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.gstack/
