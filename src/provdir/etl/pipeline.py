@@ -20,6 +20,7 @@ from .. import OUTPUT_DIR
 from ..config import Endpoint, Settings, get_settings, load_manifest
 from ..http_client import FhirSession
 from ..logging_setup import get_logger
+from ..db import safe_ident
 from ..models import RESOURCE_TABLES
 from .extract import (
     MultiSink,
@@ -88,14 +89,26 @@ def _open_for_resource(schema: str, table) -> "object":
     return conn
 
 
-def _read_chain_ids(conn, source_table: str, payer_id: str) -> list[str]:
+def _read_chain_ids(conn, source_table: str, payer_id: str,
+                    source_filter: Optional[dict] = None) -> list[str]:
     """Ids from an already-loaded table, to drive id-chained reference harvesting.
 
     source_table is a fixed internal config value (never user input); the payer
     schema is on the connection's search_path.
+
+    source_filter {column, value} narrows the source rows — e.g. chaining
+    PractitionerRole on `network` must only use Organizations that ARE networks
+    (``{column: is_network, value: 1}``), not every organization.
     """
+    safe_ident(source_table)
+    sql = f'SELECT id FROM "{source_table}" WHERE payer_id = %s'
+    params: list = [payer_id]
+    if source_filter:
+        col = safe_ident(source_filter["column"])
+        sql += f' AND "{col}" = %s'
+        params.append(source_filter["value"])
     with conn.cursor() as cur:
-        cur.execute(f'SELECT id FROM "{source_table}" WHERE payer_id = %s', (payer_id,))
+        cur.execute(sql, tuple(params))
         return [r[0] for r in cur.fetchall()]
 
 
@@ -107,8 +120,11 @@ def _read_ref_ids(conn, ref_sources: list, target_table: str) -> list[str]:
     a text[] (unnested); else a scalar ``Type/id`` string. All names are fixed
     internal config values (never user input); the payer schema is on search_path.
     """
+    safe_ident(target_table)
     parts = []
     for src_table, col in ref_sources:
+        safe_ident(src_table)
+        safe_ident(col)
         if col.endswith("_refs"):
             parts.append(f'SELECT split_part(unnest({col}), \'/\', 2) AS id FROM "{src_table}" WHERE {col} IS NOT NULL')
         else:
@@ -225,7 +241,8 @@ async def _extract_and_load(
         try:
             if adaptive_cfg and adaptive_cfg.get("mode") == "id_chain":
                 # Filter-only reference resource: chain on ids from a loaded table.
-                ids = await asyncio.to_thread(_read_chain_ids, conn, adaptive_cfg["source_table"], ep.key)
+                ids = await asyncio.to_thread(_read_chain_ids, conn, adaptive_cfg["source_table"],
+                                              ep.key, adaptive_cfg.get("source_filter"))
                 stats = await id_chain_extract(client, ep, resource_type, adaptive_cfg, sink, ids, max_pages)
             elif adaptive_cfg and adaptive_cfg.get("mode") == "id_read":
                 # Un-searchable resource: harvest by id-read from references we hold.

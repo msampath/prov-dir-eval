@@ -206,11 +206,27 @@ RESOURCE_TABLES: dict[str, Table] = {
 
 RESOURCE_TABLE_NAMES = [t.name for t in RESOURCE_TABLES.values()]
 
+# Injection-safety invariant: these table/column names are interpolated into SQL
+# strings across the ETL and quality modules. Assert at import that each is a strict
+# identifier, so string-built DDL/DML over model identifiers is provably safe (all
+# data *values* are passed as bound parameters, never interpolated).
+import re as _re  # noqa: E402
+
+_SAFE_ID = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+for _t in resource_metadata.tables.values():
+    if not _SAFE_ID.match(_t.name):
+        raise ValueError(f"unsafe table identifier: {_t.name!r}")
+    for _c in _t.columns:
+        if not _SAFE_ID.match(_c.name):
+            raise ValueError(f"unsafe column identifier: {_c.name!r}")
+
 
 def create_resource_schema(engine, schema: str) -> None:
     """Create `schema` and its 8 resource tables (idempotent)."""
     from sqlalchemy import text
 
+    if not _SAFE_ID.match(schema):
+        raise ValueError(f"unsafe schema name: {schema!r}")
     with engine.begin() as conn:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         translated = conn.execution_options(schema_translate_map={None: schema})

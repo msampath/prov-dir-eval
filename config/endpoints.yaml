@@ -142,12 +142,46 @@ endpoints:
     status: known
     mvp: false
     auth:
-      # Live test (2026-06-14): Cloudflare-fronted Azure APIM. WWW-Authenticate
-      # demands an Ocp-Apim-Subscription-Key header. NOT open (PROJECT_STATUS
-      # listed it as "None" auth; corrected here).
-      strategy: api_key_header
-      header_name: Ocp-Apim-Subscription-Key
-      secret_keys: [BCBSKS_SUBSCRIPTION_KEY]
+      # Per the BCBSKS developer portal, the Provider Directory + Formulary APIs
+      # need NO subscription key (the earlier api_key_header reading was wrong —
+      # that 401 came from a different product). Public per 42 CFR 422.120.
+      strategy: none
+    quirks:
+      # InterSystems HealthShare. Two constraints:
+      #  1. Unfiltered/broad searches are refused with HTTP 413 "SearchTooCostly"
+      #     (Practitioner?, Location?, PractitionerRole?, Organization?state=..).
+      #     Every query must be narrowed -> reference-graph + bounded-valueset
+      #     sweep, never a bare search. Confirmed working narrow forms:
+      #     Organization?name=<prefix> (960 for "a"), InsurancePlan bare (21).
+      #  2. Cloudflare bot-management 403s non-residential egress IPs before the
+      #     request reaches the FHIR server (verified 2026-07-28 from a datacenter
+      #     IP; works from an ordinary browser/network). Run this pull from a
+      #     network Cloudflare does not block.
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+      page_size: 100
+      max_concurrency: 4
+      adaptive:
+        # Roles swept over the bounded specialty ValueSet, pulling practitioner /
+        # location / organization / service along via _include (one pass, and it
+        # keeps every query narrow enough to dodge SearchTooCostly).
+        PractitionerRole:
+          mode: values
+          param: specialty
+          values_ref: specialties
+          bucket_max: 10000
+          include: [PractitionerRole:practitioner, PractitionerRole:location, PractitionerRole:organization, PractitionerRole:service, PractitionerRole:network]
+        # Organizations partition on the name prefix (name=<a-z> is accepted).
+        Organization: {param: name, mode: prefix, bucket_max: 10000}
+        # The rest are resolved from references the roles carry (no search at all).
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs], [organization_affiliation, location_refs], [healthcare_service, location_refs]]
+        HealthcareService:
+          mode: id_read
+          ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]
 
   - key: bcbs_mn
     payer_name: BCBS Minnesota
@@ -649,7 +683,9 @@ endpoints:
     base_url: https://api.interopstation.com/bcbsm/fhir
     status: known
     mvp: false
-    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+    # OPEN (probed 2026-07-26): returns Bundles unauthenticated despite OAuth2
+    # endpoints existing; no api-key needed.
+    auth: {strategy: none}
   - key: mihin_mhp
     payer_name: McLaren Health Plan
     parent_org: McLaren (via MiHIN)
@@ -681,7 +717,8 @@ endpoints:
     base_url: https://api.interopstation.com/mdhhs/fhir
     status: known
     mvp: false
-    auth: {strategy: api_key_header, header_name: x-api-key, secret_keys: [MIHIN_API_KEY]}
+    # OPEN (probed 2026-07-26): returns Bundles unauthenticated; no api-key needed.
+    auth: {strategy: none}
   - key: mihin_njios
     payer_name: New Jersey Medicaid / FamilyCare
     parent_org: State of New Jersey (via MiHIN)
@@ -782,24 +819,31 @@ endpoints:
     payer_name: Florida Blue
     parent_org: GuideWell / Florida Blue
     brands: [Florida Blue]
-    base_url: https://api.bcbsfl.com/interop/R4
+    # Public Plan-Net directory (confirmed 2026-07-28): all 8 resources return 200
+    # unauthenticated at this apigw path. /metadata 404s (no registered
+    # CapabilityStatement, like Banner). HAPI paging: next link is a full URL.
+    base_url: https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir
     status: known
     mvp: false
     auth:
-      strategy: client_id_header
-      header_name: X-IBM-Client-ID
-      secret_keys: [BCBSFL_CLIENT_ID]
+      strategy: none
+    quirks:
+      no_metadata: true
 
   - key: aetna_cvs
     payer_name: Aetna / CVS Health
     parent_org: CVS Health
     brands: [Aetna]
-    base_url: https://apix.cvshealth.com/providerdirectory/v1
+    # Base + portal confirmed 2026-07-26: /metadata is public (AETNA DaVinci PDex
+    # Plan-Net), resource reads 401 "Invalid client id or secret" -> OAuth2 creds.
+    # Register at https://developerportal.aetna.com/fhirapis
+    base_url: https://apif1.aetna.com/fhir/v1/providerdirectorydata
     status: known
     mvp: false
     auth:
       strategy: oauth2_client_credentials
-      token_url: null   # TODO: confirm at developer portal
+      token_url: https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token
+      scope: "Public NonPII"   # per Aetna token-gen guide; sent as Basic-auth client-creds
       secret_keys: [AETNA_CLIENT_ID, AETNA_CLIENT_SECRET]
 
   - key: bcbs_sc
@@ -843,16 +887,19 @@ endpoints:
       # not pursued. Evidence: docs/evidence/arkansas_bcbs_access.md
 
   - key: bcbs_la
-    payer_name: BCBS Louisiana
-    parent_org: BCBS Louisiana (OnyxOS / SAFHIR)
-    brands: [Blue Cross and Blue Shield of Louisiana]
-    base_url: https://api-bcbs-prd.safhir.io/v1/api
+    payer_name: Louisiana Blue (BCBS Louisiana)
+    parent_org: Blue Cross Blue Shield of Louisiana
+    brands: [Louisiana Blue]
+    # Migrated off SAFHIR (api-bcbs-prd.safhir.io now DNS-dead) to Azure Healthcare
+    # APIs. Public Plan-Net directory, no auth (confirmed 2026-07-28). WAF-blocks the
+    # default UA -> browser UA required.
+    base_url: https://gateway.api.lablue.com/ProviderDirectory
     status: known
     mvp: false
     auth:
-      strategy: oauth2_client_credentials
-      token_url: null
-      secret_keys: [BCBSLA_CLIENT_ID, BCBSLA_CLIENT_SECRET]
+      strategy: none
+    quirks:
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
   # ----- Base URL known, auth/specifics unconfirmed ------------------------
   - key: cigna
@@ -860,10 +907,14 @@ endpoints:
     parent_org: The Cigna Group
     brands: [Cigna]
     base_url: https://fhir.cigna.com/ProviderDirectory/v1
-    status: unknown   # auth requirements TBD
+    status: known   # confirmed 2026-07-27: public Da Vinci Plan-Net, R4 4.0.1, no auth
     mvp: false
     auth:
-      strategy: none   # provisional; verify at developer.cigna.com
+      strategy: none
+    quirks:
+      # Server returns a degenerate empty bundle (total=0, no next) for _count>=200;
+      # _count=100 paginates correctly. Cap the page size to stay under that ceiling.
+      page_size: 100
 
   - key: bcbs_az
     payer_name: AZ Blue (Blue Cross Blue Shield of Arizona)
@@ -1061,3 +1112,206 @@ endpoints:
         HealthcareService:
           mode: id_read
           ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]
+
+  # ===== Discovery round 5 (2026-07-27) — 1upHealth public tenants =====
+  # api.<slug>fhir.com/r4/public[-<product>], all no-auth. Confirmed live+populated.
+  - key: healthfirst
+    payer_name: Healthfirst (NY)
+    parent_org: Healthfirst
+    brands: [Healthfirst]
+    base_url: https://api.healthfirstfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 5)
+  - key: trillium
+    payer_name: Trillium Community Health Plan (OR)
+    parent_org: Trillium Community Health Plan
+    brands: [Trillium Community Health Plan]
+    base_url: https://api.trilliumfhir.com/r4/public
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route (discovery round 5)
+  - key: uphp
+    payer_name: Upper Peninsula Health Plan (MI)
+    parent_org: Upper Peninsula Health Plan
+    brands: [UPHP]
+    base_url: https://api.uphpfhir.com/r4/public-medicaid
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route, product-scoped (bare /r4/public = 401)
+  - key: capital_health_plan
+    payer_name: Capital Health Plan (FL)
+    parent_org: Capital Health Plan
+    brands: [Capital Health Plan]
+    base_url: https://api.capitalhealthplanfhir.com/r4/public-ma
+    status: known
+    mvp: false
+    auth:
+      strategy: none   # 1upHealth public route, product-scoped (bare /r4/public = 401)
+
+  # ===== HealthSparq "One" legacy cluster (2026-07-27) — per-tenant hosts =====
+  # Distinct deployment from the shared api-gateway.healthsparq.com (4.0.1): tenant
+  # has its OWN host serving both the FHIR base and the public-token mint,
+  # fhirVersion 4.4.0 (R4B). /metadata is public; resource data needs the minted
+  # Subject-Token + the tenant's productCode (from the member-portal deep link).
+  # NOTE: Blue Shield of CA (BSCA) and BCBS Nebraska (BCBSNE) were evaluated on
+  # this cluster and REJECTED — /metadata is public but their brand is "not
+  # configured to use" the provider-fhir-service (no public Plan-Net data path),
+  # even with the correct host + productCode. Only Health Advantage serves data.
+  - key: health_advantage_ar
+    payer_name: Health Advantage (Arkansas)
+    parent_org: Arkansas Blue Cross Blue Shield
+    brands: [Health Advantage]
+    base_url: https://healthadvantage.healthsparq.com/api/provider-fhir-service/v1/fhir
+    status: known
+    mvp: false
+    fhir_version: "4.4.0"
+    auth:
+      strategy: healthsparq_public_token
+      token_url: https://healthadvantage.healthsparq.com/api/healthsparq-public-login-service/v1/token
+      params: {insurer_code: HLTHADV_I, brand_code: HLTHADV, product_code: "915011000"}
+    quirks:
+      page_size: 100
+      next_link_replace: ["/v1/fhir/", "https://healthadvantage.healthsparq.com/api/provider-fhir-service/v1/fhir/"]
+      max_concurrency: 6
+      # Bare paging stalls far short (Location 3.3%, roles 3.8% of 5.4M). Same
+      # HealthSparq platform/scale as Regence & Medica, so use the same
+      # reference-graph harvest: sweep roles by the specialty ValueSet WITH
+      # _include (verified: specialty=207Q00000X -> 284,715, and the bundle
+      # carries Practitioner + Location), then id_read the rest from held refs.
+      # `provdir harvest` runs the include sweep; `provdir etl` runs the id_reads.
+      adaptive:
+        PractitionerRole:
+          mode: values
+          param: specialty
+          values_ref: specialties
+          bucket_max: 100000
+          include: [PractitionerRole:practitioner, PractitionerRole:location, PractitionerRole:organization, PractitionerRole:service, PractitionerRole:network]
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs], [organization_affiliation, location_refs], [healthcare_service, location_refs]]
+        HealthcareService:
+          mode: id_read
+          ref_sources: [[practitioner_role, healthcare_service_refs], [organization_affiliation, healthcare_service_refs]]
+        # OrgAffiliation stalls on bare paging (796k of 1,102,607). It answers
+        # participating-organization=<id> per org but REJECTS comma-OR batching
+        # (400), so chain one org id at a time off the 468,948 orgs we hold.
+        OrganizationAffiliation:
+          mode: id_chain
+          chain_param: participating-organization
+          source_table: organization
+          chain_batch: 1
+          chain_count: 100
+          chain_concurrency: 6
+
+  - key: kaiser
+    payer_name: Kaiser Permanente
+    parent_org: Kaiser Foundation Health Plan
+    brands: [Kaiser Permanente]
+    # Public no-auth Plan-Net directory (developer.kp.org). Honest totals (no cap
+    # games), 250 rows/page, working next links -> plain bare pull. Browser UA.
+    base_url: https://kpx-service-bus.kp.org/service/hp/mhpo/healthplanproviderv1rc
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      page_size: 250
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+      # Deep _getpages sessions get progressively slower and blow the default 30s
+      # read timeout (first pull died at ~1.9% of Practitioner). Generous timeouts
+      # + low concurrency let the long tail finish; the pull is resumable.
+      read_timeout: 180
+      request_timeout: 420
+      max_concurrency: 2
+      adaptive:
+        # Bare paging stalls on PractitionerRole (~1% of 529k) even with long
+        # timeouts, but the REVERSE chain works: PractitionerRole?practitioner=<id>
+        # resolves, and comma-OR batching is honoured (5 ids -> total=5). Practitioner
+        # itself pages fine (73%+), so chain roles off the practitioner ids we hold.
+        # (specialty= and organization= both return total=0 on this server — not
+        # indexed — so a specialty/org sweep is not an option here.)
+        PractitionerRole:
+          mode: id_chain
+          chain_param: practitioner
+          source_table: practitioner
+          chain_batch: 50
+          chain_count: 250
+          chain_concurrency: 4
+        # Bare paging dies almost immediately on these two (HCS 0.6% of 884k,
+        # InsurancePlan 0.3% of 610k). Probed 2026-07-28: HCS answers
+        # specialty=<code> (207Q00000X -> 11,838) though service-category /
+        # service-type / organization / coverage-area all return 0; InsurancePlan
+        # answers _lastUpdated (ge2020 -> 609,836 = the full set), so bisect it.
+        # specialty sweep caps at 33% because 596,402 services carry NO specialty
+        # (`specialty:missing=true`); name-prefix reaches both groups and
+        # subdivides recursively, so use that as the primary partition.
+        HealthcareService:
+          param: name
+          mode: prefix
+          bucket_max: 40000
+        # _lastUpdated bisection plateaued at 72.9% (buckets hit an internal cap,
+        # and nothing exists before 2015). Only 2,503 plans lack a name, so
+        # name-prefix reaches ~99.6% of the 609,816.
+        InsurancePlan:
+          param: name
+          mode: prefix
+          bucket_max: 40000
+
+  # ===== Public directories found via payer interop pages (2026-07-28) =====
+  # NOTE: WAF-blocks the project's default "compatible"-token UA (403); a plain
+  # browser UA is required, set per-endpoint via quirks.user_agent. (Louisiana
+  # Blue is updated in place above; UnitedHealthcare added here.)
+  - key: uhc
+    payer_name: UnitedHealthcare (Optum)
+    parent_org: UnitedHealth Group
+    brands: [UnitedHealthcare]
+    # Public no-auth Da Vinci Plan-Net directory (docs: flex.optum.com fhirpublic).
+    # Server caps `total` (and result sets) at 10000/query -> partition by
+    # address-state. OrganizationAffiliation (role=provider) and HealthcareService
+    # (service-category=prov) require special params; scoped out for the first pass.
+    base_url: https://flex.optum.com/fhirpublic/R4
+    status: known
+    mvp: false
+    resource_subset: [InsurancePlan, Organization, PractitionerRole, Practitioner, Location]
+    auth:
+      strategy: none
+    quirks:
+      user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+      # Server caps EVERY search at total=10000 and page size at 100, and rejects
+      # _getpagesoffset jumps (stateful HAPI _getpages sessions only). So the count
+      # partitioner can't use `total` until a bucket is under the cap. Measured:
+      # network alone = 10000 (capped); network+state = 6990 (real); +specialty = 550.
+      # Strategy (reference-graph): InsurancePlan (bare, ~1395) -> Organization
+      # state-partitioned (Networks are Organizations w/ plannet-Network profile,
+      # 1752 of them) -> PractitionerRole chained on each network id -> Practitioner
+      # and Location id_read from the refs those roles carry.
+      max_concurrency: 4
+      adaptive:
+        # `type` is a bounded ValueSet here and `type=ntwk` returns exactly the
+        # 1752 Networks (the state sweep never caught them — networks carry no
+        # address, so all 9522 orgs it loaded were is_network=0). `partof` does
+        # NOT link orgs to networks (returns 0); the org<->network edge is
+        # OrganizationAffiliation. Sweep both org flavours by type.
+        Organization: {param: type, mode: values, values: [ntwk], bucket_max: 9000}
+        PractitionerRole:
+          mode: id_chain
+          chain_param: network
+          source_table: organization
+          # chain ONLY off actual networks, not every organization
+          source_filter: {column: is_network, value: 1}
+          chain_batch: 1
+          chain_count: 100
+          chain_concurrency: 4
+        Practitioner:
+          mode: id_read
+          ref_sources: [[practitioner_role, practitioner_ref]]
+        Location:
+          mode: id_read
+          ref_sources: [[practitioner_role, location_refs]]

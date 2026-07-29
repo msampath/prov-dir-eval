@@ -30,3 +30,6 @@ htmlcov/
 .DS_Store
 Thumbs.db
 .gstack/
+
+# Bulk reference datasets (NPPES ~1.1GB) — downloaded, never committed
+data/

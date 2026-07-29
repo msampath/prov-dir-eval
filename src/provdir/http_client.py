@@ -119,7 +119,10 @@ class FhirClient:
             with attempt:
                 async with self._limiter:
                     auth_headers = await self._auth.headers(self._client)
-                    headers = {"Accept": FHIR_ACCEPT, **auth_headers, **kwargs.pop("headers", {})}
+                    headers = {"Accept": FHIR_ACCEPT, **auth_headers}
+                    if self.endpoint.quirks.user_agent:
+                        headers["User-Agent"] = self.endpoint.quirks.user_agent
+                    headers.update(kwargs.pop("headers", {}))
                     started = time.monotonic()
                     # Per-endpoint timeout overrides for slow servers; else global.
                     q = self.endpoint.quirks

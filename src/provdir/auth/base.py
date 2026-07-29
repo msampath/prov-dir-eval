@@ -69,6 +69,7 @@ def build_auth(endpoint: "Endpoint", settings: "Settings") -> AuthStrategy:
             token_url=auth.token_url or "",
             client_id=cid,
             client_secret=csec,
+            scope=auth.scope,
         )
 
     if strat == "healthsparq_public_token":

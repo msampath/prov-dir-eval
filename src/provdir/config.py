@@ -15,6 +15,7 @@ reported as ``skipped: missing-credentials`` rather than failing the run.
 from __future__ import annotations
 
 import os
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Optional
@@ -111,6 +112,7 @@ class AuthConfig(BaseModel):
     secret_keys: list[str] = Field(default_factory=list)
     header_name: Optional[str] = None
     token_url: Optional[str] = None
+    scope: Optional[str] = None   # OAuth2 scope, e.g. Aetna's "Public NonPII"
     # Non-secret, strategy-specific public parameters carried in the manifest
     # (e.g. HealthSparq insurer_code/brand_code/product_code — public tenant codes).
     params: dict = Field(default_factory=dict)
@@ -126,6 +128,10 @@ class Quirks(BaseModel):
     # a per-host concurrency cap. None => the global settings apply.
     min_request_interval: Optional[float] = None
     max_concurrency: Optional[int] = None
+    # Per-endpoint User-Agent override. Some payer WAFs (e.g. Louisiana Blue,
+    # UnitedHealthcare/Optum flex) 403 the project's default "compatible"-token UA
+    # but allow a plain browser UA. Set this to a full browser UA for those hosts.
+    user_agent: Optional[str] = None
     # Per-endpoint timeout overrides for SLOW servers (e.g. AmeriHealth LAEX,
     # whose pages exceed the default 30s read timeout and abort pagination).
     # read_timeout = httpx read/connect; request_timeout = hard wall-clock.
@@ -166,6 +172,15 @@ class Endpoint(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     resource_subset: Optional[list[str]] = None
     quirks: Quirks = Field(default_factory=Quirks)
+
+    @field_validator("key")
+    @classmethod
+    def _key_is_schema_safe(cls, v: str) -> str:
+        # The key doubles as the payer's Postgres schema name and is interpolated
+        # into DDL/DML, so pin it to a strict identifier pattern at load time.
+        if not re.match(r"^[a-z][a-z0-9_]*$", v):
+            raise ValueError(f"endpoint key must be a lowercase schema-safe identifier: {v!r}")
+        return v
 
     @field_validator("base_url")
     @classmethod

@@ -17,10 +17,12 @@ stays correct as endpoints are added.
 from __future__ import annotations
 
 import json
+import html
 from datetime import datetime, timezone
 
 from .. import OUTPUT_DIR
 from ..config import load_manifest
+from ..db import safe_ident
 from ..logging_setup import get_logger
 from ..etl.loader import list_payer_schemas, pg_connection
 
@@ -83,7 +85,8 @@ def gather_status() -> dict:
         payers = []
         for s in have:
             union = " UNION ALL ".join(
-                f"SELECT '{t}', count(*) FROM {s}.\"{t}\"" for t, _ in RESOURCES
+                f"SELECT '{safe_ident(t)}', count(*) FROM {safe_ident(s)}.\"{safe_ident(t)}\""
+                for t, _ in RESOURCES
             )
             cur.execute(union)
             rc = {r[0]: r[1] for r in cur.fetchall()}
@@ -147,7 +150,7 @@ def build_fragment(data: dict) -> str:
         cells = "".join(_cell(p["res"][l]) for l in labels)
         rows += (
             f'<tr><td style="padding:3px 6px;font-size:11px;white-space:nowrap;overflow:hidden;'
-            f'text-overflow:ellipsis;max-width:150px">{dot}{p["name"]}</td>{cells}'
+            f'text-overflow:ellipsis;max-width:150px">{dot}{html.escape(p["name"])}</td>{cells}'
             f'<td style="padding:3px 6px;text-align:right;font-size:11px;font-weight:500">{_ab(p["total"])}</td></tr>'
         )
     g = data["grand_total"]
