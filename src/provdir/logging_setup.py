@@ -34,6 +34,16 @@ def _redact(msg: str) -> str:
 
 class _RedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
+        # Redacting only record.msg misses everything passed as a %-arg, which is
+        # where the secrets actually are: call sites log formatted exception text
+        # (and FhirError embeds the full request URL) via log.warning("...: %s", exc).
+        # Render first, then redact, so both the template and its args are covered.
+        if record.args:
+            try:
+                record.msg = record.getMessage()
+                record.args = ()
+            except Exception:  # noqa: BLE001 - never let logging break the run
+                pass
         if isinstance(record.msg, str):
             record.msg = _redact(record.msg)
         return True

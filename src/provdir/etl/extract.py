@@ -61,6 +61,18 @@ def _oo_note(payload: dict) -> str:
     return (issue.get("details") or {}).get("text") or issue.get("diagnostics") or payload.get("resourceType")
 
 
+# The host refused us outright (auth, WAF/bot-block, or rate limit). Falling
+# through to the partition sweep would fire ~88 more requests at a server that
+# just said no — the opposite of polite.
+_REFUSED_STATUSES = (401, 403, 429)
+
+
+def _blocked(stats: dict, status: int) -> dict:
+    stats["method"] = "blocked"
+    stats["note"] = f"bare search HTTP {status}; partition sweep skipped (host refused)"
+    return stats
+
+
 def _partitions(resource_type: str) -> tuple[Optional[str], list[str]]:
     if resource_type in STATE_PARTITIONABLE:
         return "address-state", US_STATES
@@ -92,6 +104,11 @@ class ResourceSink:
         self._flush_coro = flush_coro
         self._batch = batch
         self._buf: list[dict] = []
+        # id_chain/id_read call add() from many concurrent tasks that share ONE
+        # psycopg connection and ONE TEMP stage table. Without this lock a second
+        # flush can start while the first is mid-TRUNCATE/COPY/INSERT and wipe the
+        # staged rows, silently dropping a whole batch.
+        self._lock = asyncio.Lock()
         self.streamed = 0   # resources handed to the sink (pre-DB dedup)
         self.inserted = 0   # NEW rows the DB actually inserted
 
@@ -102,11 +119,12 @@ class ResourceSink:
             await self._flush()
 
     async def _flush(self) -> None:
-        if self._buf:
-            batch, self._buf = self._buf, []
-            n = await self._flush_coro(batch)
-            if isinstance(n, int):
-                self.inserted += n
+        async with self._lock:
+            if self._buf:
+                batch, self._buf = self._buf, []
+                n = await self._flush_coro(batch)
+                if isinstance(n, int):
+                    self.inserted += n
 
     async def close(self) -> None:
         await self._flush()
@@ -123,6 +141,9 @@ class MultiSink:
         self._flush = flushers
         self._batch = batch
         self._buf: dict[str, list[dict]] = {rt: [] for rt in flushers}
+        # Same shared-connection/shared-stage-table race as ResourceSink; one lock
+        # per resource type is enough because each type has its own connection.
+        self._locks: dict[str, asyncio.Lock] = {rt: asyncio.Lock() for rt in flushers}
         self.inserted: dict[str, int] = {rt: 0 for rt in flushers}
         self.streamed: dict[str, int] = {rt: 0 for rt in flushers}
 
@@ -136,11 +157,12 @@ class MultiSink:
             await self._do_flush(rt)
 
     async def _do_flush(self, rt: str) -> None:
-        if self._buf[rt]:
-            batch, self._buf[rt] = self._buf[rt], []
-            n = await self._flush[rt](batch)
-            if isinstance(n, int):
-                self.inserted[rt] += n
+        async with self._locks[rt]:
+            if self._buf[rt]:
+                batch, self._buf[rt] = self._buf[rt], []
+                n = await self._flush[rt](batch)
+                if isinstance(n, int):
+                    self.inserted[rt] += n
 
     async def close(self) -> None:
         for rt in list(self._buf):
@@ -356,9 +378,16 @@ async def _daterange_sweep(
         else:
             stats["count_gaps"] += 1
         try:
-            pages, _ok, _, _added = await _paginate(client, endpoint, resource_type, rng, sink, page_budget)
+            pages, _ok, w_note, _added = await _paginate(
+                client, endpoint, resource_type, rng, sink, page_budget)
             stats["pages"] += pages
             stats["buckets"] += 1
+            # Same trap as the prefix/values branch: a window that dead-ends
+            # mid-pagination doesn't raise, so without this every window could
+            # truncate and the run would still be recorded "ok".
+            if w_note:
+                stats["truncated_buckets"] = stats.get("truncated_buckets", 0) + 1
+                stats.setdefault("truncated_sample", w_note)
         except Exception:  # noqa: BLE001
             stats["fetch_errors"] += 1
 
@@ -387,7 +416,7 @@ async def adaptive_extract(
     page_budget = 1 if page1_only else max_pages
     stats = {"method": f"adaptive:{param}", "pages": 0, "buckets": 0, "count_queries": 0,
              "subdivided": 0, "blind_splits": 0, "fetch_errors": 0, "counted_total": 0,
-             "count_gaps": 0, "note": None}
+             "count_gaps": 0, "truncated_buckets": 0, "note": None}
 
     if mode == "daterange":
         # Closed-key partitioning: bisect a time range on a date param (e.g.
@@ -419,11 +448,17 @@ async def adaptive_extract(
                 stats["count_gaps"] += 1
             # Fetch this bucket (small enough, at max depth, or count unavailable).
             try:
-                pages, _ok, _, _added = await _paginate(
+                pages, _ok, b_note, _added = await _paginate(
                     client, endpoint, resource_type, {param: val}, sink, page_budget
                 )
                 stats["pages"] += pages
                 stats["buckets"] += 1
+                # A bucket that dead-ends mid-pagination does NOT raise, so it
+                # never reaches fetch_errors. Count it, or a sweep in which every
+                # bucket truncated is reported as a clean "ok" run.
+                if b_note:
+                    stats["truncated_buckets"] += 1
+                    stats.setdefault("truncated_sample", b_note)
             except Exception:  # noqa: BLE001 - one flaky bucket shouldn't kill the sweep
                 stats["fetch_errors"] += 1
 
@@ -438,8 +473,18 @@ async def adaptive_extract(
         bare_total, mode, bool(cfg.get("match_all")),
         stats["counted_total"], stats["count_gaps"],
     )
+    parts = []
     if stats["fetch_errors"]:
-        stats["note"] = f"{stats['fetch_errors']} bucket fetch errors"
+        parts.append(f"{stats['fetch_errors']} bucket fetch errors")
+    if stats["truncated_buckets"]:
+        # Keep the literal "pagination stopped" wording — classify_status matches
+        # on it to mark the run partial rather than ok.
+        parts.append(
+            f"{stats['truncated_buckets']} of {stats['buckets']} buckets truncated "
+            f"(pagination stopped): {stats.get('truncated_sample', '')}"
+        )
+    if parts:
+        stats["note"] = "; ".join(parts)
     return stats
 
 
@@ -613,6 +658,8 @@ async def extract_resource(
             stats["method"] = "unsupported"
             stats["note"] = "bare search 404 (resource not served)"
             return stats
+        if exc.status in _REFUSED_STATUSES:
+            return _blocked(stats, exc.status)
         bare_reason = f"HTTP {exc.status}"
     except Exception as exc:  # noqa: BLE001
         # 5xx (after retries) or a timeout on the bare page — e.g. bcbs_mn 500s
@@ -623,6 +670,13 @@ async def extract_resource(
             stats["method"] = "unsupported"
             stats["note"] = "bare search 404 (resource not served)"
             return stats
+        # 429 arrives HERE, not as a FhirError: _request calls raise_for_status()
+        # inside the retry loop and tenacity re-raises httpx.HTTPStatusError, which
+        # escapes before get_json can wrap it. Checking only the FhirError branch
+        # would leave rate limiting — the case that most needs backing off —
+        # falling through to the ~88-request partition sweep.
+        if status in _REFUSED_STATUSES:
+            return _blocked(stats, status)
         bare_reason = f"{type(exc).__name__}: {exc}"
 
     # 2. Partition fallback (filter-required servers). Try the primary partition
@@ -645,6 +699,8 @@ async def extract_resource(
     budget_left = max_pages if max_pages is not None else PARTITION_PAGE_CAP
     used = 0
     errored = 0
+    truncated = 0
+    truncated_sample = None
     method_used = None
     for s_param, s_values in strategies:
         added_strategy = 0
@@ -652,7 +708,7 @@ async def extract_resource(
             if budget_left is not None and budget_left <= 0:
                 break
             try:
-                p, p_ok, _, added = await _paginate(
+                p, p_ok, p_note, added = await _paginate(
                     client, endpoint, resource_type, {s_param: val}, sink, budget_left
                 )
             except Exception:  # noqa: BLE001 - one flaky partition (5xx/timeout) shouldn't kill the sweep
@@ -660,6 +716,10 @@ async def extract_resource(
                 continue
             stats["pages"] += p
             added_strategy += added
+            if p_note:
+                truncated += 1
+                if not truncated_sample:
+                    truncated_sample = p_note
             if budget_left is not None:
                 budget_left -= p
             if p_ok:
@@ -674,12 +734,19 @@ async def extract_resource(
         "unsupported" if errored else f"partition:{strategies[0][0]}"
     )
     if method_used is None and errored:
-        stats["method"] = "unsupported"
-        stats["note"] = f"bare and all partitions rejected for {resource_type}"
+        # "unsupported" would read as "this resource isn't served"; every
+        # partition failing is an outage/refusal, which classify_status must not
+        # fold into "skipped".
+        stats["method"] = "partition-failed"
+        stats["note"] = f"bare and all {errored} partitions failed for {resource_type}"
     elif budget_left is not None and budget_left <= 0:
         cap = max_pages if max_pages is not None else PARTITION_PAGE_CAP
         prefix = f"{stats['note']}; " if stats.get("note") else ""
         stats["note"] = f"{prefix}partition sweep page budget exhausted (cap={cap}; our cap, not the server's)"
+    if truncated:
+        prefix = f"{stats['note']}; " if stats.get("note") else ""
+        stats["note"] = (f"{prefix}{truncated} partitions truncated "
+                         f"(pagination stopped): {truncated_sample}")
     bare_total = await _count_query(client, resource_type, {})
     stats["server_total"] = bare_total
     stats["server_total_source"] = "bare" if isinstance(bare_total, int) else None

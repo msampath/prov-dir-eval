@@ -49,7 +49,12 @@ def evaluate_resource(conn: psycopg.Connection, payer_id: str, resource_type: st
             if pct < 100.0:
                 violations.append({"element": c.label, "populated_pct": pct})
 
-    conformance = round(sum(required_pcts) / len(required_pcts), 1) if required_pcts else 100.0
+    # None, NOT 100.0, when a resource declares no required elements: rules.py has
+    # no required=True checks for PractitionerRole/HealthcareService/
+    # OrganizationAffiliation, so crediting a perfect score would hand the largest
+    # tables in a Plan-Net directory a free 100 at the heaviest row-count weight and
+    # inflate the composite. wmean() skips None, which renormalises honestly.
+    conformance = round(sum(required_pcts) / len(required_pcts), 1) if required_pcts else None
     completeness = round(sum(all_pcts) / len(all_pcts), 1) if all_pcts else None
     return {
         "resource_type": resource_type,

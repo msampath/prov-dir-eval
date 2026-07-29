@@ -16,6 +16,7 @@ UX (national -> payer drill-down) implements the Phase 6.5 user journey.
 
 from __future__ import annotations
 
+import html
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,7 +359,12 @@ def _conformance_panel(conf: Optional[dict]) -> str:
     if not conf.get("metadata_available", True):
         meta = '<span class="pill" style="background:var(--mid);color:#0b1220">no CapabilityStatement (probe-only)</span>'
     else:
-        meta = f'{server.get("software_name") or "?"} {server.get("software_version") or ""} · FHIR {server.get("fhir_version") or "?"}'
+        # These three come verbatim from the payer's own /metadata response, i.e.
+        # fully untrusted third-party input rendered into a local HTML page.
+        _e = html.escape
+        meta = (f'{_e(str(server.get("software_name") or "?"))} '
+                f'{_e(str(server.get("software_version") or ""))} · '
+                f'FHIR {_e(str(server.get("fhir_version") or "?"))}')
     return f"""<p class="muted">{meta}</p>
     <div class="cards">
       <div class="card"><div class="v">{_fmt(s.get('resource_declared_pct'))}</div><div class="l">Resources declared</div></div>

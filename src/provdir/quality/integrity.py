@@ -108,9 +108,15 @@ _ORPHAN_QUERIES: list[tuple[str, str]] = [
     ),
     (
         "location_unreferenced",
+        # The correlated form `l.id = ANY(SELECT ... FROM unnest(r.location_refs))`
+        # references both the outer and inner relation through a sublink, so the
+        # planner cannot hash it and degrades to a nested loop that rescans
+        # practitioner_role for every unreferenced location. Flattening it to a
+        # lateral unnest with a plain equality on l.id keeps the semantics and
+        # lets Postgres use a hash anti-join (one pass per table).
         "SELECT count(*) FROM location l WHERE l.payer_id = %s AND NOT EXISTS ("
-        "  SELECT 1 FROM practitioner_role r WHERE r.payer_id = l.payer_id "
-        "  AND l.id = ANY(SELECT split_part(x,'/',2) FROM unnest(r.location_refs) x))",
+        "  SELECT 1 FROM practitioner_role r, unnest(r.location_refs) x "
+        "  WHERE r.payer_id = l.payer_id AND split_part(x,'/',2) = l.id)",
     ),
     (
         "organization_unreferenced",

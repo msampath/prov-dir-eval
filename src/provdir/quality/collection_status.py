@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import html
+from collections import Counter
 from datetime import datetime, timezone
 
 from .. import OUTPUT_DIR
@@ -142,18 +143,25 @@ def build_fragment(data: dict) -> str:
     """CSS-variable widget fragment (host provides surface/text/bg vars)."""
     labels = [lbl for _, lbl in RESOURCES]
     head = '<th style="padding:3px 6px;text-align:left;font-size:11px;color:var(--text-secondary)">Source</th>' \
-        + "".join(f'<th style="padding:3px;font-size:11px;color:var(--text-secondary)">{l}</th>' for l in labels) \
+        + "".join(f'<th style="padding:3px;font-size:11px;color:var(--text-secondary)">{lbl}</th>' for lbl in labels) \
         + '<th style="padding:3px 6px;text-align:right;font-size:11px;color:var(--text-secondary)">Total</th>'
     rows = ""
     for p in data["payers"]:
         dot = f'<span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:{_TIER_DOT.get(p["tier"], "var(--text-muted)")};margin-right:5px"></span>'
-        cells = "".join(_cell(p["res"][l]) for l in labels)
+        cells = "".join(_cell(p["res"][lbl]) for lbl in labels)
         rows += (
             f'<tr><td style="padding:3px 6px;font-size:11px;white-space:nowrap;overflow:hidden;'
             f'text-overflow:ellipsis;max-width:150px">{dot}{html.escape(p["name"])}</td>{cells}'
             f'<td style="padding:3px 6px;text-align:right;font-size:11px;font-weight:500">{_ab(p["total"])}</td></tr>'
         )
     g = data["grand_total"]
+    # Derive the access mix from the data — a hardcoded "no auth" contradicted the
+    # tier dots on the same rows (the public-token tier mints a token per request).
+    tiers = Counter(p["tier"] for p in data["payers"])
+    if set(tiers) <= {"open"}:
+        access = "no auth"
+    else:
+        access = " · ".join(f"{n} {t}" for t, n in tiers.most_common())
     cards = "".join(
         f'<div style="background:var(--surface-1);border-radius:var(--radius);padding:1rem">'
         f'<div style="font-size:13px;color:var(--text-secondary)">{lbl}</div>'
@@ -161,7 +169,7 @@ def build_fragment(data: dict) -> str:
         for lbl, val in [
             ("Records collected", f"{g / 1e6:.1f}M"),
             ("Payer directories", str(data["payer_count"])),
-            ("All accessed", "no auth"),
+            ("Access", access),
         ]
     )
     legend = (

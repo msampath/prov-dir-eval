@@ -153,8 +153,15 @@ def upsert_batch(conn: psycopg.Connection, table: Table, rows: list[dict], updat
         set_cols = [c for c in cols if c not in ("payer_id", "id")]
         set_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in set_cols)
         conflict = f"ON CONFLICT (payer_id, id) DO UPDATE SET {set_clause}"
+        # DO UPDATE raises 21000 CardinalityViolation if one command touches the
+        # same conflict key twice, and a batch legitimately can: an id_chain sweep
+        # returns a role once per network it belongs to, and prefix/state
+        # partitions overlap. DO NOTHING tolerates duplicates, so only the update
+        # branch needs the staged rows collapsed to one row per key.
+        select_from_stage = f"SELECT DISTINCT ON (payer_id, id) {col_list} FROM {_STAGE} ORDER BY payer_id, id"
     else:
         conflict = "ON CONFLICT (payer_id, id) DO NOTHING"
+        select_from_stage = f"SELECT {col_list} FROM {_STAGE}"
     with conn.cursor() as cur:
         cur.execute(f"TRUNCATE {_STAGE}")
         with cur.copy(f'COPY {_STAGE} ({col_list}) FROM STDIN (FORMAT BINARY)') as copy:
@@ -163,7 +170,7 @@ def upsert_batch(conn: psycopg.Connection, table: Table, rows: list[dict], updat
                 copy.write_row([_adapt(row.get(name), types[i]) for i, name in enumerate(cols)])
         cur.execute(
             f'INSERT INTO "{table.name}" ({col_list}) '
-            f'SELECT {col_list} FROM {_STAGE} {conflict}'
+            f'{select_from_stage} {conflict}'
         )
         return cur.rowcount
 

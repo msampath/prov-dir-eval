@@ -62,6 +62,11 @@ def classify_status(
     not "ok" — and 0 rows with no verifiable total is "empty-unverified", so
     silent extraction failures can't masquerade as clean runs.
     """
+    if method in ("blocked", "partition-failed"):
+        # The host refused the bare search (401/403/429). This is an access
+        # failure, NOT "this resource isn't served" — and it must not read as
+        # "ok" just because a previous run left rows in the table.
+        return "error", str(note or "host refused the request")
     if method in ("needs-partition", "unsupported"):
         return "skipped", None
     if extract_err and loaded == 0:
@@ -227,8 +232,21 @@ async def _extract_and_load(
                     rows.append(transform_resource(r, ep.key, ep.base_url))
                 except TransformError:
                     state["transform_errors"] += 1
-            n = upsert_batch(conn, table, rows, update=upsert)
-            conn.commit()  # commit per batch -> progress survives a reaped job
+                except (ValueError, TypeError) as exc:
+                    # Malformed payer data (e.g. position.latitude="", a null in
+                    # address.line) raises before TransformError can wrap it.
+                    # Losing one resource is fine; losing the 5000-row batch is not.
+                    state["transform_errors"] += 1
+                    log.debug("transform failed: %s: %s", type(exc).__name__, exc)
+            try:
+                n = upsert_batch(conn, table, rows, update=upsert)
+                conn.commit()  # commit per batch -> progress survives a reaped job
+            except Exception:
+                # Leave the connection usable: without this the aborted transaction
+                # makes every later statement (incl. _finalize's count) fail with
+                # InFailedSqlTransaction, masking the real error.
+                conn.rollback()
+                raise
             return n
 
         async def flush(resources: list[dict]) -> int:
@@ -304,8 +322,17 @@ async def _harvest_one(session, ep: Endpoint, base_resource: str, cfg: dict, max
                     rows.append(transform_resource(r, ep.key, ep.base_url))
                 except TransformError:
                     state["errors"] += 1
-            n = upsert_batch(conn, table, rows)
-            conn.commit()
+                except (ValueError, TypeError) as exc:
+                    # Malformed payer data must cost one resource, not the batch
+                    # (same guard as the ETL path).
+                    state["errors"] += 1
+                    log.debug("harvest transform failed: %s: %s", type(exc).__name__, exc)
+            try:
+                n = upsert_batch(conn, table, rows)
+                conn.commit()
+            except Exception:
+                conn.rollback()  # keep the connection usable for the next batch
+                raise
             return n
         async def flush(resources):
             return await asyncio.to_thread(sync_flush, resources)
@@ -321,20 +348,33 @@ async def _harvest_one(session, ep: Endpoint, base_resource: str, cfg: dict, max
     except Exception as exc:  # noqa: BLE001
         extract_err = f"{type(exc).__name__}: {exc}"
         log.warning("harvest error %s: %s", ep.key, extract_err)
-    await sink.close()
+    try:
+        # A failure flushing the final partial batch must not skip every
+        # provenance write and leak the connections after an expensive sweep.
+        await sink.close()
+    except Exception as exc:  # noqa: BLE001
+        extract_err = "; ".join(filter(None, [extract_err, f"flush: {type(exc).__name__}: {exc}"]))
+        log.warning("harvest flush error %s: %s", ep.key, exc)
 
     results = {}
-    for rt, table in tables.items():
-        loaded = await asyncio.to_thread(count_rows, conns[rt], table)
-        res = await asyncio.to_thread(
-            _finalize, conns[rt], ep, rt, table, started,
-            {"method": stats.get("method"), "note": stats.get("note"),
-             "server_total": None, "harvested_via": f"include:{base_resource}"},
-            state["errors"] if rt == base_resource else 0, extract_err,
-        )
-        await asyncio.to_thread(conns[rt].close)
-        results[rt] = res
-        log.info("harvest %-14s %-22s loaded=%d", ep.key, rt, loaded)
+    try:
+        for rt, table in tables.items():
+            res = await asyncio.to_thread(
+                _finalize, conns[rt], ep, rt, table, started,
+                # Pass include_sweep's own counters through instead of rebuilding
+                # the dict, or pages/fetch_errors are silently dropped and a
+                # partly-failed sweep is recorded "ok".
+                {**stats, "server_total": None, "harvested_via": f"include:{base_resource}"},
+                state["errors"] if rt == base_resource else 0, extract_err,
+            )
+            results[rt] = res
+            log.info("harvest %-14s %-22s loaded=%d", ep.key, rt, res.get("loaded", 0))
+    finally:
+        for conn in conns.values():
+            try:
+                await asyncio.to_thread(conn.close)
+            except Exception:  # noqa: BLE001
+                pass
     return results
 
 
@@ -400,7 +440,18 @@ async def run_etl(
             rtypes = [r for r in expected if (not resources or r in resources)]
             for rtype in rtypes:
                 tasks.append(_extract_and_load(session, ep, rtype, max_pages, sem, upsert))
-        results = await asyncio.gather(*tasks)
+        # return_exceptions: one unit blowing up (a DB error outside the inner
+        # guards, say) must not discard every other unit's work AND the summary.
+        raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = []
+    for r in raw_results:
+        if isinstance(r, BaseException):
+            log.error("extract unit failed: %s: %s", type(r).__name__, r)
+            results.append({"status": "error", "loaded": 0, "resource_type": None,
+                            "payer": None, "note": f"{type(r).__name__}: {r}"})
+        else:
+            results.append(r)
 
     # Group results by payer.
     by_payer: dict[str, list[dict]] = {}

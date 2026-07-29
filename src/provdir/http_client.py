@@ -20,7 +20,7 @@ from tenacity import (
 )
 
 from .auth import AuthStrategy, build_auth
-from .config import Endpoint, Settings, get_settings
+from .config import Endpoint, Settings, get_settings, load_manifest
 from .logging_setup import get_logger
 
 log = get_logger(__name__)
@@ -58,18 +58,34 @@ _host_limiters: dict[str, _HostLimiter] = {}
 
 def _limiter_for(endpoint: Endpoint, settings: Settings) -> _HostLimiter:
     """One limiter per host; endpoint quirks override the global politeness
-    (rate-limited APIs like HealthPartners' 100 req/hour)."""
+    (rate-limited APIs like HealthPartners' 100 req/hour).
+
+    Several payers share a host (api-gateway.healthsparq.com, flex.optum.com,
+    api-ext.amerihealthcaritas.com) and may declare DIFFERENT politeness. The
+    limiter is created once per host, so taking whichever endpoint happened to
+    build it first would silently discard a stricter sibling's cap and make the
+    effective rate depend on scheduling order. Resolve the strictest declared
+    politeness across every manifest endpoint on this host instead.
+    """
     host = endpoint.host
     if host not in _host_limiters:
-        q = endpoint.quirks
-        _host_limiters[host] = _HostLimiter(
-            concurrency=q.max_concurrency or settings.http_per_host_concurrency,
-            min_interval=(
-                q.min_request_interval
-                if q.min_request_interval is not None
-                else settings.http_per_host_min_interval
-            ),
+        concurrency = endpoint.quirks.max_concurrency or settings.http_per_host_concurrency
+        interval = (
+            endpoint.quirks.min_request_interval
+            if endpoint.quirks.min_request_interval is not None
+            else settings.http_per_host_min_interval
         )
+        try:
+            siblings = [e for e in load_manifest().endpoints if e.host == host]
+        except Exception:  # noqa: BLE001 - a manifest problem must not break requests
+            siblings = []
+        for sib in siblings:
+            q = sib.quirks
+            if q.max_concurrency:
+                concurrency = min(concurrency, q.max_concurrency)
+            if q.min_request_interval is not None:
+                interval = max(interval, q.min_request_interval)
+        _host_limiters[host] = _HostLimiter(concurrency=concurrency, min_interval=interval)
     return _host_limiters[host]
 
 
