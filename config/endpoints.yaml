@@ -1315,3 +1315,65 @@ endpoints:
         Location:
           mode: id_read
           ref_sources: [[practitioner_role, location_refs]]
+
+  # ===== Innovaccer tenants (2026-07-29) — full list from operator =====
+  # Pattern: https://<tenant>.innovaccer.com/fhir/davinci_pdex_plan_net, public,
+  # no /metadata (like azblue/banner/wellmark). Confirmed live+paginating.
+  - key: plan_menonita
+    payer_name: Plan de Salud Menonita (PR)
+    parent_org: Plan de Salud Menonita
+    brands: [Plan Menonita]
+    base_url: https://planmenonita.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+  - key: next_blue_nd
+    payer_name: Next Blue of North Dakota (BCBS ND)
+    parent_org: Blue Cross Blue Shield of North Dakota
+    brands: [Next Blue of North Dakota]
+    base_url: https://nextbluend.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+  - key: wellmark_advantage
+    payer_name: Wellmark Advantage Health Plan
+    parent_org: Wellmark
+    brands: [Wellmark Advantage Health Plan]
+    # Distinct tenant from `wellmark` (Wellmark BCBS IA/SD) — this is the Medicare
+    # Advantage arm on its own Innovaccer host.
+    base_url: https://wellmarkadvantagehealthplan.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: known
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+  - key: vermont_blue_advantage
+    payer_name: Vermont Blue Advantage
+    parent_org: Blue Cross Blue Shield of Vermont
+    brands: [Vermont Blue Advantage]
+    base_url: https://vermontblueadvantage.innovaccer.com/fhir/davinci_pdex_plan_net
+    # BLOCKED (confirmed 2026-07-29 and re-tested 2026-07-30, same result both
+    # times): TCP connects instantly and the TLS handshake completes, but the
+    # server accepts the HTTP request and then returns ZERO bytes — confirmed at
+    # the protocol level with curl (15s+, no response). Not a timeout-tuning
+    # problem; the app server behind Cloudflare is not responding on this tenant.
+    # Other Innovaccer tenants on the same base_url pattern (bcbs_az, banner,
+    # wellmark, plan_menonita, next_blue_nd, wellmark_advantage) all work fine,
+    # so this is tenant-specific, not a pattern problem. Operator is contacting
+    # Innovaccer directly — do not re-attempt until that resolves.
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      read_timeout: 120
+      request_timeout: 300
+      max_concurrency: 2
