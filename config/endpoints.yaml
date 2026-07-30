@@ -768,15 +768,22 @@ endpoints:
       - Unicare
       - Wellpoint
     base_url: https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd
-    status: unknown   # unregistered path serves /metadata but 500s on ALL resource searches
+    status: unknown   # not runnable until registered (see below)
     mvp: false
     auth:
-      strategy: none
+      # Confirmed from Elevance's own "Interoperability API Endpoint Support
+      # Document" (IO105 v15.0, 2025-11-18): despite the "unregistered" path
+      # name, the Provider Directory production environment is registration-
+      # gated. Complete the "Provider Directory API Production Environment"
+      # request form on the Developer Portal -> client ID/secret + a
+      # per-registrant token URL arrive by secure email -> OAuth2
+      # client_credentials (HTTP Basic) against that token URL -> Bearer token
+      # on this SAME base_url. That matches what we see live: /metadata is 200
+      # (public discovery) but every data query 500s without the token.
+      strategy: oauth2_client_credentials
+      token_url: null   # issued per-registrant by secure email; not a fixed URL
+      secret_keys: [ELEVANCE_CLIENT_ID, ELEVANCE_CLIENT_SECRET]
     ig_version: "1.1.0"
-    # Probed 2026-07-07: /metadata 200, but Organization/Practitioner/etc. searches
-    # (bare AND filtered) all return HTTP 500 — the unregistered path publishes a
-    # CapabilityStatement but does not serve data. Registered path needs OAuth2
-    # (creds required). Not retrievable via the open path. status->unknown (excluded).
 
   - key: hcsc
     payer_name: HCSC (BCBS IL/TX/NM/OK/MT)
