@@ -73,6 +73,11 @@ class Settings(BaseSettings):
         "Mozilla/5.0 (compatible; CMS-9115F-ProvDirEval/0.1; +https://github.com/prov-dir-eval)"
     )
 
+    # Resume: a bare-pagination checkpoint older than this is ignored (the
+    # upstream directory has likely regenerated, shifting offsets) and the pull
+    # restarts fresh. See provdir.etl.extract.rewind_offset_url.
+    checkpoint_ttl_hours: float = 72.0
+
     # Reference
     plannet_ig_version: str = "1.2.0"
 
@@ -122,6 +127,10 @@ class Quirks(BaseModel):
     practitioner_requires_filter: bool = False
     default_practitioner_filter: Optional[str] = None
     page_size: Optional[int] = None
+    # Per-resource-type page_size override, for endpoints whose _count cap
+    # varies by resource (e.g. Aetna: InsurancePlan caps at 30, Practitioner
+    # at 50, everything else at 100). Checked before the flat page_size above.
+    page_size_by_resource: dict[str, int] = Field(default_factory=dict)
     total_cap: Optional[int] = None
     # Per-endpoint politeness overrides (rate-limited APIs, e.g. HealthPartners
     # at 100 req/hour): minimum seconds between request starts to this host, and

@@ -768,22 +768,34 @@ endpoints:
       - Unicare
       - Wellpoint
     base_url: https://totalview.healthos.elevancehealth.com/resources/unregistered/api/v1/fhir/cms_mandate/mcd
-    status: unknown   # not runnable until registered (see below)
+    status: known   # registration approved 2026-07-31; client credentials issued
     mvp: false
     auth:
-      # Confirmed from Elevance's own "Interoperability API Endpoint Support
-      # Document" (IO105 v15.0, 2025-11-18): despite the "unregistered" path
-      # name, the Provider Directory production environment is registration-
-      # gated. Complete the "Provider Directory API Production Environment"
-      # request form on the Developer Portal -> client ID/secret + a
-      # per-registrant token URL arrive by secure email -> OAuth2
-      # client_credentials (HTTP Basic) against that token URL -> Bearer token
-      # on this SAME base_url. That matches what we see live: /metadata is 200
-      # (public discovery) but every data query 500s without the token.
+      # Registered via the Developer Portal per Elevance's "Interoperability API
+      # Endpoint Support Document" (IO105 v15.0, 2025-11-18) — see the sibling
+      # comment history in git blame. Approval email 2026-07-31 confirmed the
+      # token URL and this same base_url for data.
       strategy: oauth2_client_credentials
-      token_url: null   # issued per-registrant by secure email; not a fixed URL
+      token_url: https://totalview.healthos.elevancehealth.com/client.oauth2/unregistered/api/v1/token
       secret_keys: [ELEVANCE_CLIENT_ID, ELEVANCE_CLIENT_SECRET]
     ig_version: "1.1.0"
+    quirks:
+      # Long-running deep-pagination sessions blow the default 30s read timeout
+      # (OrganizationAffiliation ReadTimeout'd at page 855, 53.2% coverage) —
+      # same class of issue as Kaiser. Bump both, same values that fixed it there.
+      read_timeout: 180
+      request_timeout: 420
+    # Known server-side data-quality issues, found 2026-07-31 (not our pipeline —
+    # reproduced twice, byte-identical, no fetch_errors/extract_error either time):
+    #  - InsurancePlan: server's own /InsurancePlan?_summary=count reports 1647,
+    #    but bare search+pagination exhausts (no more `next`) at 1248, no error.
+    #    Their count endpoint and their search endpoint disagree by 399 rows.
+    #  - HealthcareService: bare search failed, partition:name fallback landed
+    #    only 9,706 rows at 0.4% coverage — needs investigation (unclear if a
+    #    real server limitation or a partition-strategy mismatch for this IG).
+    # No `total` at all on any resource via a plain `_count=1` probe (see Cigna
+    # for the same pattern) — coverage % above is a `_summary=count`-scoped
+    # figure computed AFTER extraction, not available for on-demand estimation.
 
   - key: hcsc
     payer_name: HCSC (BCBS IL/TX/NM/OK/MT)
@@ -852,6 +864,17 @@ endpoints:
       token_url: https://apif1.aetna.com/fhir/v1/fhirserver_auth/oauth2/token
       scope: "Public NonPII"   # per Aetna token-gen guide; sent as Basic-auth client-creds
       secret_keys: [AETNA_CLIENT_ID, AETNA_CLIENT_SECRET]
+    quirks:
+      # Server caps _count PER RESOURCE TYPE, not endpoint-wide: most resources
+      # reject >100 ("Excessive value for _count, maximum allowed is 100"), but
+      # InsurancePlan caps at 30 and Practitioner caps at 50 (confirmed via
+      # partition-truncation notes on repeated isolated retries, not a
+      # concurrency artifact). page_size:100 silently drove those two resources
+      # into partition fallback with 0 rows landed.
+      page_size: 100
+      page_size_by_resource:
+        InsurancePlan: 30
+        Practitioner: 50
 
   - key: bcbs_sc
     payer_name: BCBS South Carolina
@@ -1366,15 +1389,13 @@ endpoints:
     parent_org: Blue Cross Blue Shield of Vermont
     brands: [Vermont Blue Advantage]
     base_url: https://vermontblueadvantage.innovaccer.com/fhir/davinci_pdex_plan_net
-    # BLOCKED (confirmed 2026-07-29 and re-tested 2026-07-30, same result both
-    # times): TCP connects instantly and the TLS handshake completes, but the
-    # server accepts the HTTP request and then returns ZERO bytes — confirmed at
-    # the protocol level with curl (15s+, no response). Not a timeout-tuning
-    # problem; the app server behind Cloudflare is not responding on this tenant.
-    # Other Innovaccer tenants on the same base_url pattern (bcbs_az, banner,
-    # wellmark, plan_menonita, next_blue_nd, wellmark_advantage) all work fine,
-    # so this is tenant-specific, not a pattern problem. Operator is contacting
-    # Innovaccer directly — do not re-attempt until that resolves.
+    # DISCONTINUED (confirmed with Innovaccer, 2026-07-31): Innovaccer no longer
+    # services this tenant — not a transient outage. Prior probes (2026-07-29,
+    # 2026-07-30) showed TCP/TLS completing normally but zero bytes returned on
+    # every request; that matches a decommissioned backend, not a bug. Other
+    # Innovaccer tenants (bcbs_az, banner, wellmark, plan_menonita, next_blue_nd,
+    # wellmark_advantage) are unaffected. Do not re-attempt; there is no fix
+    # pending. Leave status: unknown so it stays excluded from known()/pulls.
     status: unknown
     mvp: false
     auth:

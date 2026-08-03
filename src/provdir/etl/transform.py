@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 NPI_SYSTEM = "http://hl7.org/fhir/sid/us-npi"
@@ -279,6 +279,10 @@ def transform_resource(resource: dict, payer_id: str, source_base_url: str) -> d
         "resource": resource,
         "raw_hash": sha256_hash(resource),
         "meta_last_updated": parse_last_updated(resource),
+        # Stamped every (re)upsert; must be set here, not via a column default —
+        # binary COPY writes NULL for keys absent from the row dict, and
+        # _copy_columns does not skip last_seen_at.
+        "last_seen_at": datetime.now(timezone.utc),
     }
     row.update(extractor(resource))
     return row

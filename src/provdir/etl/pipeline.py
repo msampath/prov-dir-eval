@@ -25,6 +25,7 @@ from ..models import RESOURCE_TABLES
 from .extract import (
     MultiSink,
     ResourceSink,
+    bare_fingerprint,
     extract_resource,
     id_chain_extract,
     id_read_extract,
@@ -32,13 +33,16 @@ from .extract import (
 )
 from .loader import (
     count_rows,
+    delete_checkpoint,
     ensure_payer_schema,
     insert_provenance,
     latest_prior_count,
+    load_checkpoint,
     pg_connection,
     prepare_stage,
     schema_for,
     upsert_batch,
+    upsert_checkpoint,
 )
 from .transform import TransformError, transform_resource
 
@@ -141,6 +145,57 @@ def _read_ref_ids(conn, ref_sources: list, target_table: str) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def _validate_checkpoint(ckpt: Optional[dict], fingerprint: str, ttl_hours: float) -> Optional[dict]:
+    """Return the checkpoint only if it is fresh (within TTL) and its fingerprint
+    matches the current pull shape; else None (=> start fresh). A stale offset is
+    dangerous: the upstream directory may have regenerated, shifting every offset."""
+    if not ckpt:
+        return None
+    updated = ckpt.get("updated_at")
+    if updated is not None:
+        age_h = (datetime.now(tz=timezone.utc) - updated).total_seconds() / 3600.0
+        if age_h > ttl_hours:
+            log.info("checkpoint stale (%.1fh > %.1fh TTL); starting fresh", age_h, ttl_hours)
+            return None
+    if ckpt.get("params_fingerprint") != fingerprint:
+        log.info("checkpoint fingerprint mismatch; starting fresh")
+        return None
+    return ckpt
+
+
+def _write_checkpoint_guarded(conn, payer_id, resource_type, progress, page_size,
+                              fingerprint, rows_committed) -> None:
+    """Write/delete the bare-pagination checkpoint inside the batch's transaction,
+    fenced by a SAVEPOINT so a checkpoint failure can never roll back the committed
+    batch (nor escape and be misread by the extractor as an HTTP error)."""
+    if not progress or not (progress.get("active") or progress.get("exhausted")):
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SAVEPOINT provdir_ckpt")
+        if progress.get("exhausted"):
+            delete_checkpoint(conn, payer_id, resource_type)
+        else:
+            upsert_checkpoint(
+                conn, payer_id, resource_type,
+                resume_url=progress.get("page_url"),
+                pages_done=progress.get("pages", 0),
+                rows_added=(progress.get("added_base", 0) or 0) + rows_committed,
+                page_size=page_size,
+                params_fingerprint=fingerprint,
+            )
+        with conn.cursor() as cur:
+            cur.execute("RELEASE SAVEPOINT provdir_ckpt")
+    except Exception as exc:  # noqa: BLE001 - never cost the batch for a checkpoint
+        try:
+            with conn.cursor() as cur:
+                cur.execute("ROLLBACK TO SAVEPOINT provdir_ckpt")
+        except Exception:  # noqa: BLE001
+            pass
+        log.warning("checkpoint write failed for %s/%s (batch still committed): %s",
+                    payer_id, resource_type, exc)
+
+
 def _finalize(conn, ep, resource_type, table, started, stats, transform_errors, extract_err) -> dict:
     """Sync: count what landed, classify status, write provenance, commit."""
     loaded = count_rows(conn, table)
@@ -172,12 +227,20 @@ def _finalize(conn, ep, resource_type, table, started, stats, transform_errors, 
     }
     if status_note:
         notes["status_note"] = status_note
+    if stats.get("resumed_from_page") is not None:
+        notes["resumed_from_page"] = stats.get("resumed_from_page")
+        notes["resumed_offset"] = stats.get("resumed_offset")
     if coverage_pct is not None and coverage_pct > 100.0:
         # Landed more than the server claims to have => the server's total is
         # wrong (e.g. bcbs_mn reports total=50); don't trust it as a denominator.
         notes["server_total_misreported"] = True
     if pct_change is not None and pct_change <= DATA_DROP_THRESHOLD:
         notes["data_drop_flag"] = f"{pct_change}% vs prior {prior}"
+
+    # A clean terminal state means there's nothing left to resume; drop any
+    # checkpoint (no-op if absent). Retained on error/partial so --resume works.
+    if status in ("ok", "empty-unverified", "skipped"):
+        delete_checkpoint(conn, ep.key, resource_type)
 
     run_id = insert_provenance(
         conn,
@@ -216,14 +279,29 @@ async def _extract_and_load(
     max_pages: Optional[int],
     sem: asyncio.Semaphore,
     upsert: bool = False,
+    resume: bool = False,
 ) -> dict:
     async with sem:
+        settings = get_settings()
         started = datetime.now(tz=timezone.utc)
         client = session.client_for(ep)
         table = RESOURCE_TABLES[resource_type]
         schema = schema_for(ep.key)
         conn = await asyncio.to_thread(_open_for_resource, schema, table)
-        state = {"transform_errors": 0}
+        state = {"transform_errors": 0, "rows_committed": 0}
+
+        # Bare-pagination checkpoint plumbing. `progress` is shared with sync_flush
+        # (safe: bare pagination is single-task — see _paginate docstring). It stays
+        # empty (=> no checkpoint writes) for adaptive/id_chain/id_read units.
+        fingerprint = bare_fingerprint(ep, resource_type, settings.http_default_count)
+        page_size = (ep.quirks.page_size_by_resource.get(resource_type)
+                     or ep.quirks.page_size or settings.http_default_count)
+        progress: dict = {}
+        resume_ckpt = None
+        if resume:
+            raw_ckpt = await asyncio.to_thread(load_checkpoint, conn, ep.key, resource_type)
+            await asyncio.to_thread(conn.commit)  # don't hold a read txn open for hours
+            resume_ckpt = _validate_checkpoint(raw_ckpt, fingerprint, settings.checkpoint_ttl_hours)
 
         def sync_flush(resources: list[dict]) -> int:
             rows = []
@@ -240,6 +318,12 @@ async def _extract_and_load(
                     log.debug("transform failed: %s: %s", type(exc).__name__, exc)
             try:
                 n = upsert_batch(conn, table, rows, update=upsert)
+                state["rows_committed"] += len(rows)
+                # Checkpoint in the SAME transaction as the batch, so it can never
+                # name data that isn't durable. SAVEPOINT-fenced: failure loses the
+                # checkpoint, never the batch.
+                _write_checkpoint_guarded(conn, ep.key, resource_type, progress,
+                                          page_size, fingerprint, state["rows_committed"])
                 conn.commit()  # commit per batch -> progress survives a reaped job
             except Exception:
                 # Leave the connection usable: without this the aborted transaction
@@ -267,7 +351,8 @@ async def _extract_and_load(
                 ids = await asyncio.to_thread(_read_ref_ids, conn, adaptive_cfg["ref_sources"], table.name)
                 stats = await id_read_extract(client, ep, resource_type, adaptive_cfg, sink, ids, max_pages)
             else:
-                stats = await extract_resource(client, ep, resource_type, sink, max_pages)
+                stats = await extract_resource(client, ep, resource_type, sink, max_pages,
+                                               resume_ckpt=resume_ckpt, progress=progress)
         except Exception as exc:  # noqa: BLE001
             extract_err = f"{type(exc).__name__}: {exc}"
             log.warning("etl extract error %s/%s: %s", ep.key, resource_type, extract_err)
@@ -407,6 +492,7 @@ async def run_etl(
     resources: Optional[list[str]] = None,
     concurrency: int = 6,
     upsert: bool = False,
+    resume: bool = False,
     settings: Optional[Settings] = None,
 ) -> dict:
     settings = settings or get_settings()
@@ -439,7 +525,7 @@ async def run_etl(
             expected = ep.expected_resources(manifest.plannet_resources)
             rtypes = [r for r in expected if (not resources or r in resources)]
             for rtype in rtypes:
-                tasks.append(_extract_and_load(session, ep, rtype, max_pages, sem, upsert))
+                tasks.append(_extract_and_load(session, ep, rtype, max_pages, sem, upsert, resume))
         # return_exceptions: one unit blowing up (a DB error outside the inner
         # guards, say) must not discard every other unit's work AND the summary.
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)

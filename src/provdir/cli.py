@@ -58,6 +58,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_etl.add_argument("--resources", help="comma-separated resource types (default: all expected)")
     p_etl.add_argument("--upsert", action="store_true",
                        help="on (payer_id,id) conflict UPDATE the row (refresh changed records) instead of skipping")
+    p_etl.add_argument("--resume", action="store_true",
+                       help="resume bare pagination from the last committed checkpoint (offset servers; 72h TTL)")
 
     sub.add_parser("coverage", help="per-(payer, resource) extraction coverage scoreboard")
     sub.add_parser("status-dashboard", help="build the collection-status dashboard (payer x resource coverage)")
@@ -127,6 +129,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 max_pages=args.max_pages,
                 resources=resources,
                 upsert=args.upsert,
+                resume=args.resume,
             )
         )
         return 0 if summary.get("ok") else 1

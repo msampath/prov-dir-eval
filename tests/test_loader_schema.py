@@ -27,6 +27,6 @@ def test_resource_metadata_has_eight_tables():
 
 
 def test_shared_metadata_is_separate():
-    assert set(shared_metadata.tables) == {"provenance", "data_quality_score"}
+    assert set(shared_metadata.tables) == {"provenance", "data_quality_score", "extract_checkpoint"}
     # resource tables must NOT be in the shared (public) metadata
     assert "organization" not in shared_metadata.tables
