@@ -6,6 +6,11 @@ Interoperability & Patient Access Final Rule, **CMS-9115-F**), ingests them into
 localhost Postgres, and evaluates the data — retrievable completeness (coverage),
 IG conformance, and referential integrity.
 
+> **Disclosure approach.** Analytics and findings are shared with each payer
+> directly first, through their compliance team's email contact. They are made
+> public only after the payer has acknowledged them. This is done out of respect
+> and in the spirit of collaboration.
+
 > **Disclaimer.** This is a personal / educational data-exploration project.
 > Findings are point-in-time observations of public endpoints, may reflect transient
 > conditions or our own tooling, and are **not** legal, compliance, or professional
@@ -25,11 +30,13 @@ IG conformance, and referential integrity.
   can't.
 - **Evaluates** IG conformance and referential integrity on the landed data.
 
-Current snapshot: **~87M resources across 44 payer directories** (see
+Current snapshot: **~148M resources across 60 payer directories** (see
 `/provdir-acquisition` dashboard / `provdir status-dashboard`). This grew from a
 7-payer, ~5.9M-row MVP; the phased build (scaffolding → conformance → schema → ETL →
 quality → score → dashboard) is complete, and the active focus has been maximizing
-retrievable coverage before analysis.
+retrievable coverage before analysis. Acquisition now runs on a monthly re-pull
+cadence with per-row `last_seen_at` stamping, so upstream-removed records are
+detectable rather than accumulating silently.
 
 ## Architecture
 
@@ -52,6 +59,9 @@ src/provdir/
     collection_status.py  # acquisition dashboard (row counts + measured coverage)
     ...                   # completeness, integrity, scoring, evaluation dashboard
 config/endpoints.yaml  # the endpoint manifest — source of truth for every payer
+scripts/
+  orchestrate.py       # deterministic monthly re-pull: host-lane scheduling + stall watchdog
+  bulk_ingest.py       # pull a resource via FHIR Bulk Data $export (servers that support it)
 migrations/            # Alembic
 output/, reference/    # generated artifacts + auto-fetched IG (git-ignored)
 ```
@@ -71,7 +81,12 @@ Ingestion is **streaming and resumable**: the extractor streams resources to the
 in ~5k-row batches (`COPY` → temp stage → `INSERT … ON CONFLICT (payer_id, id)`), committed
 per batch, so a killed multi-hour pull keeps everything landed and resumes on re-run. The
 conflict action is `DO NOTHING` by default (insert-only, additive); pass `--upsert` to use
-`DO UPDATE` (refresh changed records in place).
+`DO UPDATE` (refresh changed records in place, and stamp `last_seen_at`).
+
+For bare pagination, `--resume` restores true position: each batch commit also writes a
+checkpoint (`public.extract_checkpoint`) in the same transaction, so a re-run continues
+from the last committed page instead of re-walking from page 1 (72h TTL + a params
+fingerprint guard so a stale cursor is discarded rather than trusted).
 
 ## Extraction strategies
 
@@ -87,6 +102,7 @@ resource from each endpoint's `quirks.adaptive` config:
 | **id_chain** | `?<ref>=<id1>,<id2>,…` over ids we already hold (comma = FHIR OR, batched) | a resource is only reachable by reference (e.g. roles a bare search under-serves) |
 | **id_read** | `GET {Type}/{id}` for ids referenced elsewhere (not paginated) | a resource has no working search partition |
 | **include** (`provdir harvest`) | sweep roles by specialty with `_include` to pull roles + practitioners + locations + orgs + services in one pass | large directories with no usable search partition (Regence-class) |
+| **bulk** (`scripts/bulk_ingest.py`) | FHIR Bulk Data `$export` (async job → ndjson) loaded through the same transform/upsert path | a server declares `$export` and it beats capped paginated search (validated on Aetna; matched pagination within 0.02%) |
 
 Coverage for id_chain/id_read/include is bounded by the reference subgraph we hold (a
 measured residual — e.g. a practitioner with no PractitionerRole is unreachable and
@@ -120,7 +136,9 @@ All commands are `python -m provdir.cli <command>` (or the `provdir` console scr
 |---|---|
 | `provdir smoke` | liveness of the endpoint set → `output/smoke_results.json` |
 | `provdir conformance` | CapabilityStatement vs Plan-Net IG → `output/conformance/` |
-| `provdir etl [--subset a,b] [--resources R] [--upsert] [--max-pages N]` | rows in Postgres + `output/etl_summary.json` |
+| `provdir etl [--subset a,b] [--resources R] [--upsert] [--resume] [--max-pages N]` | rows in Postgres + `output/etl_summary.json` |
+| `python scripts/orchestrate.py [--dry-run] [--status] [--no-skip]` | monthly re-pull across all payers, one sequential lane per host, stall-killed units auto-retried |
+| `python scripts/bulk_ingest.py --payer P --type R` | load one resource via FHIR Bulk Data `$export` |
 | `provdir harvest --subset <payer>` | reference-graph (`_include`) role sweep for a big directory |
 | `provdir coverage` | per-(payer, resource) landed-vs-server_total scoreboard |
 | `provdir status-dashboard` | acquisition dashboard → `output/collection_status.{html,json,_widget.html}` |
