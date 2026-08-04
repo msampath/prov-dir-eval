@@ -204,6 +204,61 @@ def latest_prior_count(conn: psycopg.Connection, payer_id: str, resource_type: s
         return row[0] if row else None
 
 
+def load_checkpoint(conn: psycopg.Connection, payer_id: str, resource_type: str) -> Optional[dict]:
+    """Read the bare-pagination checkpoint for (payer, resource), or None.
+
+    public.-qualified so it works regardless of the connection's search_path.
+    Does NOT commit — the caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT resume_url, pages_done, rows_added, page_size, params_fingerprint, updated_at "
+            "FROM public.extract_checkpoint WHERE payer_id = %s AND resource_type = %s",
+            (payer_id, resource_type),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "resume_url": row[0], "pages_done": row[1], "rows_added": row[2],
+        "page_size": row[3], "params_fingerprint": row[4], "updated_at": row[5],
+    }
+
+
+def upsert_checkpoint(
+    conn: psycopg.Connection, payer_id: str, resource_type: str, resume_url: Optional[str],
+    pages_done: int, rows_added: int, page_size: Optional[int], params_fingerprint: str,
+) -> None:
+    """Insert/update the checkpoint. Does NOT commit (caller owns the txn).
+
+    updated_at is set explicitly on BOTH insert and conflict — the server_default
+    only fires on insert, so a bare EXCLUDED update would freeze the timestamp and
+    break the TTL freshness check.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO public.extract_checkpoint "
+            "(payer_id, resource_type, resume_url, pages_done, rows_added, "
+            " page_size, params_fingerprint, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
+            "ON CONFLICT (payer_id, resource_type) DO UPDATE SET "
+            "resume_url = EXCLUDED.resume_url, pages_done = EXCLUDED.pages_done, "
+            "rows_added = EXCLUDED.rows_added, page_size = EXCLUDED.page_size, "
+            "params_fingerprint = EXCLUDED.params_fingerprint, updated_at = now()",
+            (payer_id, resource_type, resume_url, pages_done, rows_added,
+             page_size, params_fingerprint),
+        )
+
+
+def delete_checkpoint(conn: psycopg.Connection, payer_id: str, resource_type: str) -> None:
+    """Remove the checkpoint (no-op if absent). Does NOT commit."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM public.extract_checkpoint WHERE payer_id = %s AND resource_type = %s",
+            (payer_id, resource_type),
+        )
+
+
 def insert_provenance(conn: psycopg.Connection, record: dict) -> int:
     cols = [
         "payer_id", "source_base_url", "resource_type", "started_at", "finished_at",

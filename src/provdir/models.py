@@ -46,6 +46,10 @@ def _common_columns() -> list[Column]:
         Column("raw_hash", Text, nullable=False),
         Column("meta_last_updated", DateTime(timezone=True)),
         Column("ingested_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+        # Stamped by transform on every (re)upsert so a monthly re-pull can tell
+        # still-present rows from upstream-deleted ghosts (last_seen_at < run start).
+        # Only refreshed under --upsert; DO NOTHING skips existing rows entirely.
+        Column("last_seen_at", DateTime(timezone=True)),
     ]
 
 
@@ -192,6 +196,24 @@ data_quality_score = Table(
     Column("detail", JSONB),
 )
 
+# Durable bare-pagination cursor for `provdir etl --resume`. One row per
+# (payer, resource) being pulled; written in the SAME transaction as each 5000-row
+# batch commit so it never points past durable data. Deleted on clean exhaustion.
+extract_checkpoint = Table(
+    "extract_checkpoint",
+    shared_metadata,
+    Column("payer_id", Text, primary_key=True),
+    Column("resource_type", Text, primary_key=True),
+    # URL of the page being CONSUMED at commit time (not the next link): resuming
+    # re-fetches at most one already-seen page, which ON CONFLICT dedupes.
+    Column("resume_url", Text),
+    Column("pages_done", Integer, nullable=False, server_default="0"),   # cumulative across resumes
+    Column("rows_added", BigInteger, nullable=False, server_default="0"),
+    Column("page_size", Integer),               # _count in effect (drives offset rewind)
+    Column("params_fingerprint", Text),         # guards resuming into a different method/params
+    Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
+)
+
 # resource_type (FHIR) -> table mapping used by the ETL loader.
 RESOURCE_TABLES: dict[str, Table] = {
     "Organization": organization,
@@ -231,6 +253,14 @@ def create_resource_schema(engine, schema: str) -> None:
         conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
         translated = conn.execution_options(schema_translate_map={None: schema})
         resource_metadata.create_all(bind=translated, checkfirst=True)
+        # Self-heal columns introduced after a schema was first created (per-payer
+        # resource tables are not alembic-managed). Nullable ADD COLUMN is a
+        # metadata-only, instant DDL even on multi-million-row tables.
+        for _t in resource_metadata.tables.values():
+            conn.execute(text(
+                f'ALTER TABLE "{schema}"."{_t.name}" '
+                'ADD COLUMN IF NOT EXISTS last_seen_at timestamptz'
+            ))
 
 
 def create_shared_tables(engine) -> None:

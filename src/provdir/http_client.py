@@ -213,8 +213,12 @@ class FhirClient:
             key, _, val = filt.partition("=")
             params.setdefault(key, val)
         if "_count" not in params:
-            # Per-endpoint page_size overrides the global default _count.
-            params["_count"] = q.page_size or self._settings.http_default_count
+            # Per-resource override, then per-endpoint, then the global default.
+            params["_count"] = (
+                q.page_size_by_resource.get(resource_type)
+                or q.page_size
+                or self._settings.http_default_count
+            )
         return params
 
     async def search_page(self, resource_type: str, params: Optional[dict] = None) -> dict:

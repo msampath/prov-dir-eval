@@ -1,0 +1,519 @@
+#%RAML 1.0
+annotationTypes:
+  amf-serverDescription:
+    type: any
+  amf-exclusiveMinimum:
+    type: any
+  amf-binding:
+    type: any
+  amf-pattern:
+    type: any
+  amf-payloads:
+    type: any
+  amf-exclusiveMaximum:
+    type: any
+  oas-summary:
+    type: any
+  amf-consumes:
+    type: any
+  amf-additionalProperties:
+    type: any
+  amf-or:
+    type: any
+  amf-url:
+    type: any
+  amf-externalDocs:
+    type: any
+  amf-flow:
+    type: any
+  amf-oasDeprecated:
+    type: any
+  amf-contact:
+    type: any
+  amf-multipleOf:
+    type: any
+  amf-xor:
+    type: any
+  amf-not:
+    type: any
+  amf-callbacks:
+    type: any
+  amf-produces:
+    type: any
+  amf-format:
+    type: any
+  amf-license:
+    type: any
+  amf-summary:
+    type: any
+  amf-responses:
+    type: any
+  amf-maximum:
+    type: any
+  amf-tags:
+    type: any
+  amf-dependencies:
+    type: any
+  amf-readOnly:
+    type: any
+  amf-tuple:
+    type: any
+  amf-examples:
+    type: any
+  amf-collectionFormat:
+    type: any
+  amf-termsOfService:
+    type: any
+  amf-servers:
+    type: any
+  amf-xone:
+    type: any
+  amf-defaultResponse:
+    type: any
+  amf-baseUriParameters:
+    type: any
+  amf-parameters:
+    type: any
+  oas-tags:
+    type: any
+  amf-minimum:
+    type: any
+  amf-recursive:
+    type: any
+  amf-and:
+    type: any
+title: Provider Finder
+baseUri: api.hcsc.net/providerfinder/
+version: v1
+protocols:
+  - HTTPS
+/sapphire/fhir: {}
+/sapphire/fhir/Location:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    queryParameters:
+      name:
+        required: false
+        type: string
+      address-city:
+        required: false
+        type: string
+      address-state:
+        required: false
+        type: string
+      address-postalcode:
+        required: false
+        type: string
+    body: {}
+    responses:
+      "200":
+        description: Location found by name
+        body: {}
+    (oas-summary): Search a Location by given query params
+    (oas-tags):
+      - FHIR Location
+/sapphire/fhir/Location/{id}:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    body: {}
+    responses:
+      "200":
+        description: Location found
+        body: {}
+      "404":
+        description: Location not found
+        body: {}
+    (oas-summary): Retrieves a Location by id
+    (oas-tags):
+      - FHIR Location
+  uriParameters:
+    id:
+      type: string
+/sapphire/fhir/Organization:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    queryParameters:
+      name:
+        required: false
+        type: string
+    body: {}
+    responses:
+      "200":
+        description: Organization found by name
+        body: {}
+    (oas-summary): Search a Organization by given query params
+    (oas-tags):
+      - FHIR Organization
+/sapphire/fhir/Organization/{id}:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    body: {}
+    responses:
+      "200":
+        description: Practitioner found
+        body: {}
+      "404":
+        description: Organization not found
+        body: {}
+    (oas-summary): Retrieves a Organization by id
+    (oas-tags):
+      - FHIR Organization
+  uriParameters:
+    id:
+      type: string
+/sapphire/fhir/OrganizationAffiliation:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    queryParameters:
+      specialty:
+        required: false
+        type: string
+      network:
+        required: false
+        type: string
+      location:
+        required: false
+        type: string
+      primary-organization:
+        required: false
+        type: string
+    body: {}
+    responses:
+      "200":
+        description: Organization Affiliation by specialty
+        body: {}
+    (oas-summary): Search OrganizationAffiliation by given query params
+    (oas-tags):
+      - FHIR OrganizationAffiliation
+/sapphire/fhir/OrganizationAffiliation/{id}:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    body: {}
+    responses:
+      "200":
+        description: Practitioner found
+        body: {}
+    (oas-summary): Retrieves a OrganizationAffiliation by id
+    (oas-tags):
+      - FHIR OrganizationAffiliation
+  uriParameters:
+    id:
+      type: string
+/sapphire/fhir/Practitioner:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    queryParameters:
+      family:
+        required: false
+        type: string
+      given:
+        required: false
+        type: string
+      name:
+        required: false
+        type: string
+    body: {}
+    responses:
+      "200":
+        description: Practitioner found by name
+        body: {}
+    (oas-summary): Search a Practitioner by given query params
+    (oas-tags):
+      - FHIR Practitioner
+/sapphire/fhir/Practitioner/{id}:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    body: {}
+    responses:
+      "200":
+        description: Practitioner found
+        body: {}
+      "404":
+        description: Practitioner not found
+        body: {}
+    (oas-summary): Retrieves a Practitioner by id
+    (oas-tags):
+      - FHIR Practitioner
+  uriParameters:
+    id:
+      type: string
+/sapphire/fhir/PractitionerRole:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    queryParameters:
+      practitioner:
+        required: false
+        type: string
+      organization:
+        required: false
+        type: string
+      network:
+        required: false
+        type: string
+      location:
+        required: false
+        type: string
+      specialty:
+        required: false
+        type: string
+    body: {}
+    responses:
+      "200":
+        description: PractitionerRole found by given query params
+        body: {}
+    (oas-summary): Search a PractitionerRole by given query params
+    (oas-tags):
+      - FHIR PractitionerRole
+/sapphire/fhir/PractitionerRole/{id}:
+  get:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    body: {}
+    responses:
+      "200":
+        description: PractitionerRole found
+        body: {}
+      "404":
+        description: PractitionerRole not found
+        body: {}
+    (oas-summary): Retrieves a PractitionerRole by id
+    (oas-tags):
+      - FHIR PractitionerRole
+  uriParameters:
+    id:
+      type: string
+/hcsc/{resourcePath}:
+  post:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    headers:
+      ClientId:
+        description: Client ID
+        required: true
+        type: string
+      ClientSecret:
+        description: Client Secret
+        required: true
+        type: string
+      Accept:
+        required: false
+        type: string
+      Content-Type:
+        description: Body Content Type
+        required: false
+        type: string
+      Authorization:
+        description: JWT Token
+        required: false
+        type: string
+    body:
+      application/json:
+        type: any
+    responses:
+      "200":
+        description: Successful Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 200
+                response: Ok
+            type: any
+      "201":
+        description: Created Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 201
+                response: Created
+            type: any
+      "400":
+        description: Bad Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 400
+                response: Bad Request
+            type: any
+      "401":
+        description: Unauthorized Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 401
+                response: Unauthorized
+            type: any
+      "403":
+        description: Forbidden Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 403
+                response: Forbidden
+            type: any
+      "404":
+        description: Not Found
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 404
+                response: Not Found
+            type: any
+      "500":
+        description: Internal Server Error
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 500
+                response: Internal Server Error
+            type: any
+  uriParameters:
+    resourcePath:
+      type: string
+/bam/{resourcePath}:
+  post:
+    (amf-consumes):
+      - application/json
+    (amf-produces):
+      - application/json
+    headers:
+      ClientId:
+        description: Client ID
+        required: true
+        type: string
+      ClientSecret:
+        description: Client Secret
+        required: true
+        type: string
+      Accept:
+        required: false
+        type: string
+      Content-Type:
+        description: Body Content Type
+        required: false
+        type: string
+      Authorization:
+        description: JWT Token
+        required: false
+        type: string
+    body:
+      application/json:
+        type: any
+    responses:
+      "200":
+        description: Successful Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 200
+                response: Ok
+            type: any
+      "201":
+        description: Created Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 201
+                response: Created
+            type: any
+      "400":
+        description: Bad Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 400
+                response: Bad Request
+            type: any
+      "401":
+        description: Unauthorized Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 401
+                response: Unauthorized
+            type: any
+      "403":
+        description: Forbidden Request
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 403
+                response: Forbidden
+            type: any
+      "404":
+        description: Not Found
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 404
+                response: Not Found
+            type: any
+      "500":
+        description: Internal Server Error
+        body:
+          application/json:
+            example:
+              strict: false
+              value:
+                responseCode: 500
+                response: Internal Server Error
+            type: any
+  uriParameters:
+    resourcePath:
+      type: string
