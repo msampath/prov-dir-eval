@@ -327,10 +327,10 @@ def run_unit(unit: Unit, lane: str, attempt: int, shared: _Shared, conn) -> str:
                 age = now - t0
                 if age > grace_for(unit):
                     stall = 0 if new_rows > 0 else stall + 1
-                    if stall >= STALL_POLLS:
-                        proc.kill(); killed = True; kill_reason = "no-distinct-growth"
-                    elif age > max_runtime_for(unit):
-                        proc.kill(); killed = True; kill_reason = "max-runtime"
+                    if stall >= STALL_POLLS or age > max_runtime_for(unit):
+                        kill_reason = "no-distinct-growth" if stall >= STALL_POLLS else "max-runtime"
+                        proc.kill()
+                        killed = True
                 shared.set_live(lane, {"unit": unit.key, "pid": proc.pid, "attempt": attempt,
                                        "age_s": round(age), "new_rows": new_rows,
                                        "stall_polls": stall, "rows": cur})
