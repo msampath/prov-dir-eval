@@ -875,6 +875,7 @@ endpoints:
       page_size_by_resource:
         InsurancePlan: 30
         Practitioner: 50
+        PractitionerRole: 50   # same "maximum allowed is 50" cap as Practitioner
 
   - key: bcbs_sc
     payer_name: BCBS South Carolina
