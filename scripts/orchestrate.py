@@ -41,9 +41,20 @@ from provdir.models import RESOURCE_TABLES                      # noqa: E402
 # --- tunable policy constants ---------------------------------------------
 POLL_INTERVAL_S = 300          # 5-min watchdog tick (user spec)
 GRACE_S = 1200                 # 20-min initial grace before stall-counting
-ZERO_POLLS_TO_KILL = 2         # consecutive zero-delta polls past grace => kill (=> 10 min)
+# Progress = DISTINCT-row growth, NOT tuple-writes. Under --upsert a stuck pull can
+# re-upsert rows it already has forever (n_tup_upd climbs, count(*) flat); that is
+# NOT progress and must be killed. So the watchdog polls count(*) and kills after
+# STALL_POLLS consecutive polls with zero new distinct rows past the grace window.
+STALL_POLLS = 3                # 3 * 5min = 15 min of no new rows past grace => kill
+MAX_RUNTIME_S = 12 * 3600      # hard backstop: kill any unit past this regardless
 MAX_LANES = 8                  # concurrent lanes
 HOST_BUSY_RECHECK_S = 30       # re-scan cadence when an external process holds a lane's host
+
+# Units that legitimately run very long (huge PractitionerRole sets) get a longer
+# max-runtime backstop. The distinct-growth check still protects them from stalls.
+MAX_RUNTIME_OVERRIDES: dict = {
+    ("humana", "PractitionerRole"): 30 * 3600,
+}
 
 # Longer grace for units with a long quiet phase before rows land: id_read/id_chain
 # reference-graph queries (uhc/uhc_optum), daterange count-bisection (humana),
@@ -159,17 +170,6 @@ def table_count(conn, unit: Unit) -> int:
     return _scalar(conn, f'SELECT count(*) FROM "{unit.schema}"."{unit.table}"')
 
 
-def write_activity(conn, unit: Unit) -> int:
-    """Cumulative insert+update tuple count for the unit's table (O(1) — the
-    watchdog's progress signal; a delta of 0 across polls means no writes)."""
-    return _scalar(
-        conn,
-        "SELECT COALESCE(n_tup_ins,0)+COALESCE(n_tup_upd,0) "
-        "FROM pg_stat_user_tables WHERE schemaname=%s AND relname=%s",
-        (unit.schema, unit.table),
-    )
-
-
 # --- running-process detection (Windows) ----------------------------------
 _CMD_SUBSET = re.compile(r"--subset\s+(\S+)")
 _CMD_RES = re.compile(r"--resources\s+(\S+)")
@@ -268,6 +268,8 @@ def build_plan(args) -> tuple:
         lane = lane_of(ep.host)
         expected = ep.expected_resources(manifest.plannet_resources)
         ordered = [r for r in RESOURCE_ORDER if r in expected]
+        if getattr(args, "resource", None):
+            ordered = [r for r in ordered if r == args.resource]
         for r in ordered:
             if r in excl:
                 skipped.append({"payer": ep.key, "resource": r, "outcome": "skipped-excluded"})
@@ -293,6 +295,11 @@ def grace_for(unit: Unit) -> int:
             or GRACE_OVERRIDES.get(unit.payer) or GRACE_S)
 
 
+def max_runtime_for(unit: Unit) -> int:
+    return (MAX_RUNTIME_OVERRIDES.get((unit.payer, unit.resource))
+            or MAX_RUNTIME_OVERRIDES.get(unit.payer) or MAX_RUNTIME_S)
+
+
 def run_unit(unit: Unit, lane: str, attempt: int, shared: _Shared, conn) -> str:
     log_path = shared.run_dir / "logs" / f"{unit.payer}__{unit.resource}{'' if attempt == 1 else f'.retry{attempt-1}'}.log"
     cmd = [sys.executable, "-m", "provdir.cli", "etl",
@@ -303,28 +310,30 @@ def run_unit(unit: Unit, lane: str, attempt: int, shared: _Shared, conn) -> str:
     with log_path.open("w", encoding="utf-8") as logf:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, cwd=str(REPO))
         shared.add_pid(proc.pid)
-        last = write_activity(conn, unit)
-        zero = 0
+        last = table_count(conn, unit)   # DISTINCT rows: the only honest progress signal
+        stall = 0
         next_poll = t0 + POLL_INTERVAL_S
         killed = False
+        kill_reason = None
         try:
             while proc.poll() is None:
                 time.sleep(2)
                 now = time.monotonic()
                 if now < next_poll:
                     continue
-                cur = write_activity(conn, unit)
-                delta = cur - last
+                cur = table_count(conn, unit)
+                new_rows = cur - last          # re-upserting existing rows => 0 here
                 last = cur
                 age = now - t0
                 if age > grace_for(unit):
-                    zero = zero + 1 if delta <= 0 else 0
-                    if zero >= ZERO_POLLS_TO_KILL:
+                    stall = 0 if new_rows > 0 else stall + 1
+                    if stall >= STALL_POLLS or age > max_runtime_for(unit):
+                        kill_reason = "no-distinct-growth" if stall >= STALL_POLLS else "max-runtime"
                         proc.kill()
                         killed = True
                 shared.set_live(lane, {"unit": unit.key, "pid": proc.pid, "attempt": attempt,
-                                       "age_s": round(age), "delta": delta,
-                                       "rows": table_count(conn, unit)})
+                                       "age_s": round(age), "new_rows": new_rows,
+                                       "stall_polls": stall, "rows": cur})
                 next_poll += POLL_INTERVAL_S
             rc = proc.wait()
         finally:
@@ -333,8 +342,8 @@ def run_unit(unit: Unit, lane: str, attempt: int, shared: _Shared, conn) -> str:
     dur = round(time.monotonic() - t0)
     outcome = "stall-killed" if killed else ("completed" if rc == 0 else "error")
     shared.journal({"payer": unit.payer, "resource": unit.resource, "lane": lane,
-                    "attempt": attempt, "outcome": outcome, "exit_code": rc,
-                    "rows_before": rows_before, "rows_after": rows_after,
+                    "attempt": attempt, "outcome": outcome, "kill_reason": kill_reason,
+                    "exit_code": rc, "rows_before": rows_before, "rows_after": rows_after,
                     "rows_added": rows_after - rows_before, "duration_s": dur,
                     "started_at": started, "log": str(log_path)})
     return outcome
@@ -438,7 +447,9 @@ def main() -> int:
                     help="re-run every unit even if it completed ok this month (kickoff)")
     ap.add_argument("--cutoff", default=None,
                     help="ISO datetime; skip units ok since this (default: 1st of this month UTC)")
-    ap.add_argument("--only", default=None, help="restrict to a single payer key (debug)")
+    ap.add_argument("--only", default=None, help="restrict to a single payer key")
+    ap.add_argument("--resource", default=None,
+                    help="restrict to a single resource type (isolated per-payer/resource run)")
     args = ap.parse_args()
 
     base = REPO / "output" / "orchestrator"
