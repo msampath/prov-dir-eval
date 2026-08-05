@@ -116,6 +116,10 @@ class AuthConfig(BaseModel):
     strategy: AuthStrategyName = "none"
     secret_keys: list[str] = Field(default_factory=list)
     header_name: Optional[str] = None
+    # For client_id_secret_headers: override the two header names. Defaults are
+    # ClientId/ClientSecret (HCSC MuleSoft); Florida Blue (IBM API Connect) uses
+    # X-IBM-Client-Id / X-IBM-Client-Secret.
+    secret_header_name: Optional[str] = None
     token_url: Optional[str] = None
     scope: Optional[str] = None   # OAuth2 scope, e.g. Aetna's "Public NonPII"
     # Non-secret, strategy-specific public parameters carried in the manifest
