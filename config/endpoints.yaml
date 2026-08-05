@@ -815,6 +815,8 @@ endpoints:
     auth:
       strategy: client_id_secret_headers
       secret_keys: [HCSC_CLIENT_ID, HCSC_CLIENT_SECRET]
+      header_name: ClientId              # MuleSoft; declared explicitly (not via default)
+      secret_header_name: ClientSecret
     resource_subset:
       - Organization
       - Practitioner
@@ -841,11 +843,19 @@ endpoints:
     # Public Plan-Net directory (confirmed 2026-07-28): all 8 resources return 200
     # unauthenticated at this apigw path. /metadata 404s (no registered
     # CapabilityStatement, like Banner). HAPI paging: next link is a full URL.
+    # 2026-08-04: registered a Confidential app (IBM API Connect). The directory
+    # still works anonymously (verified 200 with none / id-only / id+secret), so
+    # auth is NOT required — we send the app's X-IBM headers only so our monthly
+    # extract is attributed/rate-allocated to our app rather than hitting FL Blue
+    # anonymously.
     base_url: https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir
     status: known
     mvp: false
     auth:
-      strategy: none
+      strategy: client_id_secret_headers
+      secret_keys: [BCBSFL_CLIENT_ID, BCBSFL_CLIENT_SECRET]
+      header_name: X-IBM-Client-Id
+      secret_header_name: X-IBM-Client-Secret
     quirks:
       no_metadata: true
 

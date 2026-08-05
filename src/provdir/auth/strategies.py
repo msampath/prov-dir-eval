@@ -40,14 +40,17 @@ class ClientIdSecretHeaders(AuthStrategy):
 
     name = "client_id_secret_headers"
 
-    def __init__(self, client_id: str, client_secret: str) -> None:
+    def __init__(self, client_id: str, client_secret: str,
+                 id_header: str = "ClientId", secret_header: str = "ClientSecret") -> None:
         self.client_id = client_id
         self.client_secret = client_secret
+        self.id_header = id_header
+        self.secret_header = secret_header
 
     async def headers(self, client: httpx.AsyncClient) -> dict[str, str]:
         if not (self.client_id and self.client_secret):
             return {}
-        return {"ClientId": self.client_id, "ClientSecret": self.client_secret}
+        return {self.id_header: self.client_id, self.secret_header: self.client_secret}
 
 
 class ApiKeyHeader(AuthStrategy):

@@ -55,7 +55,11 @@ def build_auth(endpoint: "Endpoint", settings: "Settings") -> AuthStrategy:
     if strat == "client_id_secret_headers":
         cid = settings.secret(auth.secret_keys[0]) if len(auth.secret_keys) > 0 else ""
         csec = settings.secret(auth.secret_keys[1]) if len(auth.secret_keys) > 1 else ""
-        return ClientIdSecretHeaders(client_id=cid, client_secret=csec)
+        return ClientIdSecretHeaders(
+            client_id=cid, client_secret=csec,
+            id_header=auth.header_name or "ClientId",
+            secret_header=auth.secret_header_name or "ClientSecret",
+        )
 
     if strat == "api_key_header":
         header_name = auth.header_name or "apikey"
