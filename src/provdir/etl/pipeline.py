@@ -237,9 +237,11 @@ def _finalize(conn, ep, resource_type, table, started, stats, transform_errors, 
     if pct_change is not None and pct_change <= DATA_DROP_THRESHOLD:
         notes["data_drop_flag"] = f"{pct_change}% vs prior {prior}"
 
-    # A clean terminal state means there's nothing left to resume; drop any
-    # checkpoint (no-op if absent). Retained on error/partial so --resume works.
-    if status in ("ok", "empty-unverified", "skipped"):
+    # Drop the checkpoint only on genuine clean completion. Retained on
+    # error/partial AND skipped: a transient 503 on the first page classifies as
+    # `skipped` (bare rejected), and must NOT wipe a prior partial's position, or
+    # the --resume ratchet loses its place on a flaky server (Elevance).
+    if status in ("ok", "empty-unverified"):
         delete_checkpoint(conn, ep.key, resource_type)
 
     run_id = insert_provenance(
