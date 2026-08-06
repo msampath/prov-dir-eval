@@ -252,6 +252,12 @@ def resumable_lines(hx: httpx.Client, url_holder: dict, auth_holder: dict,
                     offset += len(buf)
                     tail, buf = buf, b""
                     yield tail, offset
+                if total is None:
+                    # No Content-Length/Content-Range: a mid-stream clean close is
+                    # indistinguishable from EOF. Bucket URLs virtually always send a
+                    # length; warn loudly if one didn't so a silent truncation is visible.
+                    print(f"  WARNING: stream ended at byte {offset:,} with no length "
+                          "header; cannot verify completeness", flush=True)
                 return
         except ExpiredURL as e:
             fails = 1 if offset > attempt_start else fails + 1
@@ -374,6 +380,13 @@ def run_capture(hx, payer, rtype, base, stage_dir, fresh) -> int:
     side = d / "_export.json"
     auth_holder = {"h": mint_auth(payer)}
 
+    if fresh:
+        # A new export has a different byte layout; resuming download_to_file by
+        # on-disk size would append the new export onto stale bytes -> corrupt
+        # mixed-generation file. Remove prior capture artifacts before re-exporting.
+        for stale in list(d.glob("*.ndjson")) + [side, d / "_complete.json"]:
+            stale.unlink(missing_ok=True)
+
     if side.exists() and not fresh:
         meta = json.loads(side.read_text())
         status_url = meta["status_url"]
@@ -406,8 +419,8 @@ def run_capture(hx, payer, rtype, base, stage_dir, fresh) -> int:
             for o in fresh_out:
                 if basename_of(o["url"]) == basename_of(want):
                     return o["url"]
-            if idx < len(fresh_out):
-                return fresh_out[idx]["url"]
+            # No positional fallback: resuming at byte N of the WRONG file is silent
+            # corruption. A hard stop is recoverable (re-run resumes), so raise.
             raise RuntimeError(f"cannot locate {basename_of(want)} in refreshed manifest")
 
         print(f"capturing file {fi} -> {dest}", flush=True)
@@ -570,8 +583,7 @@ def main() -> int:
                     for o in fresh:
                         if basename_of(o["url"]) == basename_of(want):
                             return o["url"]
-                    if idx < len(fresh):
-                        return fresh[idx]["url"]
+                    # no positional fallback: wrong-file resume = silent corruption
                     raise RuntimeError(
                         f"cannot locate {basename_of(want)} in refreshed manifest")
 

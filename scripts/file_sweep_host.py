@@ -26,11 +26,21 @@ from sqlalchemy import text                    # noqa: E402
 # excluded). Each is swept for every resource type it serves, minus Endpoint.
 PAYERS = [
     "premera", "hap", "devoted", "christus", "kaiser", "amerihealth_laex",
-    "regence", "medica", "capital_blue", "humana", "uhc_optum",
+    "regence", "medica", "capital_blue", "humana", "uhc_optum", "uhc",
     "amerihealth_deex", "amerihealth_flex", "amerihealth_ncex", "amerihealth_scex",
     "bcbs_ks", "bcbs_la", "excellus", "hcsc", "mihin_bcbsm", "mihin_mdhhs",
     "mvphealthcare", "vermont_blue_advantage", "bcbs_mn",
+    "bcbs_az",  # re-pull to file: PractitionerRole suspected over-corrected low (99k)
+    "dean_healthsparq", "health_advantage_ar",  # reference-graph sources, force bare
 ]
+
+# Reference-graph sources (id_chain / id_read / _include harvest in config). Per
+# user: try plain BARE search to file for these instead of the reference-graph
+# logic (validated on kaiser PractitionerRole: bare works, server_total 531,619).
+REFGRAPH = {
+    "humana", "excellus", "bcbs_ks", "mvphealthcare", "regence", "medica",
+    "dean_healthsparq", "health_advantage_ar", "kaiser", "uhc",
+}
 OUT_ROOT = r"I:\file_export"
 # dependency-friendly order (chain sources before their dependents)
 RES_ORDER = ["InsurancePlan", "Organization", "Location", "HealthcareService",
@@ -60,11 +70,11 @@ def main() -> int:
     print(f"host {a.host}: {len(units)} units", flush=True)
     for p, rt in units:
         print(f"[{a.host}] start {p} {rt}", flush=True)
-        subprocess.run(
-            [sys.executable, str(REPO / "scripts" / "paginate_to_file.py"),
-             "--payer", p, "--resource", rt, "--out-dir", f"{OUT_ROOT}\\{p}"],
-            cwd=str(REPO),
-        )
+        cmd = [sys.executable, str(REPO / "scripts" / "paginate_to_file.py"),
+               "--payer", p, "--resource", rt, "--out-dir", f"{OUT_ROOT}\\{p}"]
+        if p in REFGRAPH:
+            cmd.append("--force-bare")
+        subprocess.run(cmd, cwd=str(REPO))
         print(f"[{a.host}] done  {p} {rt}", flush=True)
     print(f"host {a.host}: COMPLETE", flush=True)
     return 0
