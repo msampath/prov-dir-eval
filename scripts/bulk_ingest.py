@@ -189,7 +189,11 @@ def resumable_lines(hx: httpx.Client, url_holder: dict, auth_holder: dict,
                     auth_holder["h"] = mint_auth(payer)
                     time.sleep(min(5 * fails, 60))
                     continue
-                if resp.status_code in (403, 410):
+                if resp.status_code in (403, 404, 410):
+                    # 403/410 = signed URL expired; 404 = URL rotated or the
+                    # export object is still materializing in the bucket. All
+                    # three recover the same way: re-poll the status manifest for
+                    # a fresh URL and retry with backoff (bounded by MAX_RECONNECTS).
                     raise ExpiredURL(f"{resp.status_code} on output URL")
                 if resp.status_code == 416:
                     return  # Range past EOF => file already fully consumed
@@ -270,12 +274,222 @@ def resumable_lines(hx: httpx.Client, url_holder: dict, auth_holder: dict,
             continue
 
 
+def download_to_file(hx, url_holder, auth_holder, refresh, payer, dest_path, send_auth):
+    """Stream one output file's RAW bytes to dest_path, resuming from the current
+    on-disk size across drops / URL expiry / transient 5xx. The file's own size IS
+    the checkpoint (no sidecar). Returns (bytes_on_disk, total_or_None).
+
+    This is the time-critical capture: no transform, no DB, no index I/O — just
+    network -> sequential disk write, to grab the export before the server purges it.
+    """
+    start = os.path.getsize(dest_path) if os.path.exists(dest_path) else 0
+    offset = start
+    fails = 0
+    total: int | None = None
+    fh = open(dest_path, "ab")
+    try:
+        while True:
+            attempt_start = offset
+            headers = {"Range": f"bytes={offset}-", "Accept-Encoding": "identity"}
+            if send_auth:
+                headers.update(auth_holder["h"])
+            try:
+                with hx.stream("GET", url_holder["u"], headers=headers) as resp:
+                    if resp.status_code == 401:
+                        fails += 1
+                        if fails > MAX_RECONNECTS:
+                            raise ExpiredURL("repeated 401 on output URL")
+                        auth_holder["h"] = mint_auth(payer)
+                        time.sleep(min(5 * fails, 60))
+                        continue
+                    if resp.status_code in (403, 404, 410):
+                        raise ExpiredURL(f"{resp.status_code} on output URL")
+                    if resp.status_code == 416:
+                        return offset, total
+                    if resp.status_code == 429 or resp.status_code >= 500:
+                        raise TransientHTTP(f"{resp.status_code} on output URL")
+                    resp.raise_for_status()
+                    if resp.headers.get("content-encoding"):
+                        raise SystemExit(
+                            f"output is {resp.headers['content-encoding']}-encoded "
+                            "despite Accept-Encoding: identity; byte-resume unsafe")
+                    if resp.status_code == 206:
+                        cr = resp.headers.get("content-range", "")
+                        s = cr[6:].split("-", 1)[0].strip() if cr.startswith("bytes ") else ""
+                        if s.isdigit() and int(s) != offset:
+                            raise SystemExit(f"206 range start {s} != requested {offset}")
+                    if total is None:
+                        total = _range_total(resp, offset)
+                    skip = 0 if resp.status_code == 206 else offset
+                    progressed = False
+                    for chunk in resp.iter_bytes():
+                        if skip:
+                            if len(chunk) <= skip:
+                                skip -= len(chunk)
+                                continue
+                            chunk = chunk[skip:]
+                            skip = 0
+                        if chunk:
+                            fh.write(chunk)
+                            offset += len(chunk)
+                            progressed = True
+                    if progressed:
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    if total is not None and offset < total:
+                        fails = 1 if offset > attempt_start else fails + 1
+                        if fails > MAX_RECONNECTS:
+                            raise RuntimeError(f"truncated at {offset:,}/{total:,}")
+                        print(f"  truncation at {offset:,}/{total:,}; reconnect #{fails}",
+                              flush=True)
+                        time.sleep(min(5 * fails, 120))
+                        continue
+                    return offset, total
+            except ExpiredURL as e:
+                fails = 1 if offset > attempt_start else fails + 1
+                if fails > MAX_RECONNECTS:
+                    raise
+                print(f"  url expired ({e}); refreshing signed URL, resume at "
+                      f"byte {offset:,}", flush=True)
+                url_holder["u"] = refresh()
+                time.sleep(min(5 * fails, 60))
+                continue
+            except (TransientHTTP, *TRANSIENT) as e:
+                fails = 1 if offset > attempt_start else fails + 1
+                if fails > MAX_RECONNECTS:
+                    raise
+                print(f"  stream drop ({type(e).__name__}: {e}); reconnect #{fails} "
+                      f"at byte {offset:,}", flush=True)
+                time.sleep(min(5 * fails, 120))
+                continue
+    finally:
+        fh.close()
+
+
+def run_capture(hx, payer, rtype, base, stage_dir, fresh) -> int:
+    """Phase 1: capture the export to local ndjson file(s) under stage_dir, fast."""
+    import pathlib
+    d = pathlib.Path(stage_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    side = d / "_export.json"
+    auth_holder = {"h": mint_auth(payer)}
+
+    if side.exists() and not fresh:
+        meta = json.loads(side.read_text())
+        status_url = meta["status_url"]
+        manifest = refresh_manifest(hx, status_url, auth_holder, payer)
+        print(f"resuming capture from {side}", flush=True)
+    else:
+        status_url = kickoff(hx, base, rtype, auth_holder["h"])
+        manifest = poll_manifest(hx, status_url, auth_holder, payer)
+        side.write_text(json.dumps({"status_url": status_url, "rtype": rtype}))
+
+    requires_token = manifest.get("requiresAccessToken", True)
+    outputs = [o for o in (manifest.get("output") or []) if o.get("type") == rtype]
+    print(f"capture manifest: {len(outputs)} file(s); "
+          f"requiresAccessToken={requires_token}", flush=True)
+    if not outputs:
+        raise SystemExit("no output files in manifest (export purged?); re-run with --fresh")
+
+    auth_holder["h"] = mint_auth(payer)
+    captured = []
+    for fi, out in enumerate(outputs):
+        dest = d / f"{basename_of(out['url'])}.ndjson"
+        url_holder = {"u": out["url"]}
+
+        def refresh(want=out["url"], idx=fi):
+            fresh_out = [o for o in refresh_manifest(hx, status_url, auth_holder, payer)
+                         .get("output", []) if o.get("type") == rtype]
+            for o in fresh_out:
+                if basename_of(o["url"]) == basename_of(want):
+                    return o["url"]
+            if idx < len(fresh_out):
+                return fresh_out[idx]["url"]
+            raise RuntimeError(f"cannot locate {basename_of(want)} in refreshed manifest")
+
+        print(f"capturing file {fi} -> {dest}", flush=True)
+        got, total = download_to_file(hx, url_holder, auth_holder, refresh,
+                                      payer, str(dest), requires_token)
+        ok = (total is None) or (got >= total)
+        print(f"  file {fi}: {got:,} bytes"
+              + (f" / {total:,} ({'COMPLETE' if ok else 'INCOMPLETE'})" if total else ""),
+              flush=True)
+        captured.append({"path": str(dest), "bytes": got, "total": total, "complete": ok})
+
+    (d / "_complete.json").write_text(json.dumps({"files": captured}, indent=2))
+    allok = all(c["complete"] for c in captured)
+    print(f"CAPTURE {'COMPLETE' if allok else 'INCOMPLETE'}: "
+          f"{sum(c['bytes'] for c in captured):,} bytes across {len(captured)} file(s)",
+          flush=True)
+    print("next: ingest each file with  --ingest-file <path>  (offline, no Aetna race)",
+          flush=True)
+    return 0 if allok else 2
+
+
+def run_ingest_local(payer, rtype, base, table, schema, path) -> int:
+    """Phase 2: ingest a captured local ndjson file into Postgres (no network)."""
+    started = datetime.now(tz=timezone.utc)
+    conn = pg_connection(schema)
+    prepare_stage(conn, table)
+    batch: list[dict] = []
+    total = 0
+    errors = 0
+    try:
+        with open(path, "rb") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line:
+                    continue
+                total += 1
+                try:
+                    batch.append(transform_resource(json.loads(line), payer, base))
+                except (TransformError, ValueError, TypeError):
+                    errors += 1
+                    continue
+                if len(batch) >= BATCH:
+                    upsert_batch(conn, table, batch, update=True)
+                    conn.commit()
+                    batch = []
+                    if total % 500000 < BATCH:
+                        print(f"  ingested ~{total:,} lines", flush=True)
+            if batch:
+                upsert_batch(conn, table, batch, update=True)
+                conn.commit()
+        loaded = count_rows(conn, table)
+        prior = latest_prior_count(conn, payer, rtype)
+        pct = round(100.0 * (loaded - prior) / prior, 1) if prior else None
+        cov = round(100.0 * loaded / total, 1) if total else None
+        insert_provenance(conn, {
+            "payer_id": payer, "source_base_url": base, "resource_type": rtype,
+            "started_at": started, "finished_at": datetime.now(tz=timezone.utc),
+            "status": "ok", "page_count": 0, "resource_count": loaded,
+            "error_count": errors, "prior_count": prior, "pct_change": pct,
+            "notes": {
+                "method": "bulk-export-local", "server_total": total,
+                "server_total_source": "bulk", "coverage_pct": cov,
+                "transform_errors": errors, "fetch_errors": 0, "extract_error": None,
+                "note": f"ingested from local capture {path}",
+                "residual_unreachable": max(0, total - loaded), "partitions": 0,
+            },
+        })
+        conn.commit()
+        print(f"DONE {payer}/{rtype}: local_lines={total:,} loaded_distinct={loaded:,} "
+              f"transform_errors={errors}", flush=True)
+    finally:
+        conn.close()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--payer", required=True)
     ap.add_argument("--type", required=True, dest="rtype")
     ap.add_argument("--fresh", action="store_true",
                     help="ignore/clear any existing checkpoint and re-export")
+    ap.add_argument("--stage-dir",
+                    help="PHASE 1 capture mode: download export to local ndjson here")
+    ap.add_argument("--ingest-file",
+                    help="PHASE 2 mode: ingest this captured local ndjson into Postgres")
     args = ap.parse_args()
     payer, rtype = args.payer, args.rtype
 
@@ -284,6 +498,13 @@ def main() -> int:
     table = RESOURCE_TABLES[rtype]
     schema = schema_for(payer)
     CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.ingest_file:
+        return run_ingest_local(payer, rtype, base, table, schema, args.ingest_file)
+    if args.stage_dir:
+        with httpx.Client(timeout=httpx.Timeout(600.0, read=600.0),
+                          follow_redirects=True) as hx:
+            return run_capture(hx, payer, rtype, base, args.stage_dir, args.fresh)
 
     if args.fresh:
         clear_ckpt(payer, rtype)

@@ -26,7 +26,8 @@ UNITS = [
     ("uhc_optum", "OrganizationAffiliation"),
     ("amerihealth_laex", "OrganizationAffiliation"), ("amerihealth_laex", "PractitionerRole"),
     ("devoted", "PractitionerRole"),
-    ("premera", "PractitionerRole"),
+    # premera PractitionerRole held out until 2026-08-21 (upstream fix pending);
+    # no point hammering it before the fix lands.
     ("mihin_bcbsm", "Location"), ("mihin_bcbsm", "Organization"),
     ("mihin_bcbsm", "OrganizationAffiliation"), ("mihin_bcbsm", "Practitioner"),
     ("mihin_bcbsm", "PractitionerRole"),
