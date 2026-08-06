@@ -52,7 +52,7 @@ from provdir.http_client import FhirSession as FhirSessionLocal     # noqa: E402
 
 BATCH = 5000
 POLL_SECONDS = 15
-MAX_POLLS = 360           # 360 * 15s = 90 min to generate the export
+MAX_POLLS = 1440          # 1440 * 15s = 360 min (6h) to generate the export
 MAX_RECONNECTS = 40       # consecutive failures (no progress) before giving up
 CKPT_DIR = REPO / "output" / "orchestrator"
 
@@ -377,12 +377,15 @@ def run_capture(hx, payer, rtype, base, stage_dir, fresh) -> int:
     if side.exists() and not fresh:
         meta = json.loads(side.read_text())
         status_url = meta["status_url"]
-        manifest = refresh_manifest(hx, status_url, auth_holder, payer)
-        print(f"resuming capture from {side}", flush=True)
+        # re-poll the SAME job: handles both a still-generating export (202) and a
+        # ready one (200), so a timed-out/killed poll resumes instead of re-exporting
+        print(f"resuming capture; re-polling export job {status_url}", flush=True)
+        manifest = poll_manifest(hx, status_url, auth_holder, payer)
     else:
         status_url = kickoff(hx, base, rtype, auth_holder["h"])
-        manifest = poll_manifest(hx, status_url, auth_holder, payer)
+        # record the job BEFORE the (long) poll so a restart can resume this export
         side.write_text(json.dumps({"status_url": status_url, "rtype": rtype}))
+        manifest = poll_manifest(hx, status_url, auth_holder, payer)
 
     requires_token = manifest.get("requiresAccessToken", True)
     outputs = [o for o in (manifest.get("output") or []) if o.get("type") == rtype]
