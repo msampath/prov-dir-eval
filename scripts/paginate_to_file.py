@@ -35,10 +35,11 @@ from provdir.config import get_settings, load_manifest          # noqa: E402
 from provdir.http_client import FhirSession                     # noqa: E402
 from provdir.etl.extract import ResourceSink, extract_resource  # noqa: E402
 
-# methods that mean "the unit finished" (mark .done, drop the checkpoint). A bare
-# walk is only done when it exhausted (progress.exhausted); needs-partition and
-# blocked are 503/refused failures that should retry on the next run, not be marked.
-_DONE_METHODS = ("bare", "partition", "adaptive", "unsupported")
+# methods that mean "the unit finished" (mark .done, drop the checkpoint). Use the
+# ":"-suffixed forms so failure labels don't match: "partition:<param>" is a
+# successful sweep, but "partition-failed" / "needs-partition" / "blocked" are
+# failures that must retry. A bare walk is only done when it exhausted.
+_DONE_METHODS = ("bare", "partition:", "adaptive:", "unsupported")
 
 
 async def _run(payer: str, rtype: str, out_dir: str, max_pages: int | None) -> int:
@@ -115,7 +116,14 @@ async def _run(payer: str, rtype: str, out_dir: str, max_pages: int | None) -> i
     method = stats.get("method") or ""
     note = stats.get("note")
     bare_incomplete = progress.get("active") and not progress.get("exhausted")
-    finished = (any(method.startswith(m) for m in _DONE_METHODS)) and not bare_incomplete
+    # A 0-row "completion" whose note reports fetch/bucket/timeout errors is a
+    # failure, not an empty resource: don't mark it .done, so it retries. A clean
+    # empty bundle (note=None, e.g. a server that genuinely has 0) still marks done.
+    nl = (note or "").lower()
+    errored_empty = written["n"] == 0 and any(
+        k in nl for k in ("fetch error", "bucket", "timeout", "rejected", "error"))
+    finished = (any(method.startswith(m) for m in _DONE_METHODS)
+                and not bare_incomplete and not errored_empty)
     if finished:
         ckpt_path.unlink(missing_ok=True)
         done.write_text(json.dumps({"method": method, "written": written["n"], "note": note}))
