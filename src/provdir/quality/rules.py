@@ -43,12 +43,17 @@ RESOURCE_RULES: dict[str, list[ElementCheck]] = {
         ElementCheck("qualification", "(resource ? 'qualification')", False),
         ElementCheck("telecom", "(resource ? 'telecom')", False),
     ],
+    # Checks use the EXTRACTED columns (not `resource ? 'key'`) so they score
+    # correctly whether the row stores the full resource or a slim stub (the raw
+    # JSON for such payers lives in the capture files). Semantics are one-directional
+    # stricter than key-presence: a key present but with no usable reference/code
+    # extracts to NULL, so this measures usable data, not bare key presence.
     "PractitionerRole": [
-        ElementCheck("practitioner", "(resource ? 'practitioner')", False),
-        ElementCheck("organization", "(resource ? 'organization')", False),
-        ElementCheck("code", "(resource ? 'code')", False),
-        ElementCheck("specialty", "(resource ? 'specialty')", False),
-        ElementCheck("location", "(resource ? 'location')", False),
+        ElementCheck("practitioner", "(practitioner_ref IS NOT NULL)", False),
+        ElementCheck("organization", "(organization_ref IS NOT NULL)", False),
+        ElementCheck("code", "(role_codes IS NOT NULL)", False),
+        ElementCheck("specialty", "(specialty_codes IS NOT NULL)", False),
+        ElementCheck("location", "(location_refs IS NOT NULL)", False),
     ],
     "Location": [
         ElementCheck("status", "(resource ? 'status')", False),
