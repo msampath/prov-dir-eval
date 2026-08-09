@@ -103,7 +103,11 @@ DONE_TABLE = "public.slim_load_done"
 # Decimal GB (10**9), matching both the probe's printed figures (which divide
 # by 1e9) and the plan's ~650-vs-774 arithmetic.
 CAPACITY_CAP_BYTES = 650 * 10 ** 9
-INDEX_OVERHEAD_FACTOR = 0.9
+# 3 indexes (PK on payer_id,id + practitioner_ref + organization_ref) vs heap.
+# Grounded in a real measurement: the PK was 7.27 GB at 59.8M rows (~61 GB at
+# 500M); the two ref indexes are similar, so ~160 GB total ~= 0.43x heap. Use
+# 0.5 for a small safety margin (0.9 was a ~2x-too-high guess that false-aborted).
+INDEX_OVERHEAD_FACTOR = 0.5
 SORT_HEADROOM_BYTES = 50 * 10 ** 9
 
 
