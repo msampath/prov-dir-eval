@@ -40,7 +40,7 @@ sys.path.insert(0, str(REPO / "src"))
 from provdir.config import load_manifest                             # noqa: E402
 from provdir.etl.loader import (                                      # noqa: E402
     count_rows, ensure_payer_schema, insert_provenance, pg_connection,
-    prepare_stage, schema_for, upsert_batch,
+    assert_not_slim, prepare_stage, schema_for, upsert_batch,
 )
 from provdir.etl.transform import TransformError, transform_resource  # noqa: E402
 from provdir.models import RESOURCE_TABLES                            # noqa: E402
@@ -91,6 +91,10 @@ def load_file(payer: str, resource: str, path: Path, base_url: str, table, schem
     conn = pg_connection(schema)
     result = UnitResult(payer=payer, resource=resource)
     try:
+        # Refuse before reading the file: these sweeps upsert with update=True,
+        # which on a slim table would overwrite every stub `resource` with the
+        # full JSON it was deliberately loaded without.
+        assert_not_slim(conn, payer, resource, what="a file-sweep load")
         prepare_stage(conn, table)
         before = count_rows(conn, table)
         batch: list[dict] = []

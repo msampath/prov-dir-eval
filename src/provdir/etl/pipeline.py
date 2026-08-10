@@ -41,6 +41,7 @@ from .loader import (
     pg_connection,
     prepare_stage,
     schema_for,
+    slim_registry,
     upsert_batch,
     upsert_checkpoint,
 )
@@ -96,6 +97,16 @@ def _open_for_resource(schema: str, table) -> "object":
     conn = pg_connection(schema)
     prepare_stage(conn, table)
     return conn
+
+
+def _load_slim_units() -> set[tuple[str, str]]:
+    """Read the slim registry on a short-lived connection (sync; call via
+    asyncio.to_thread from async code)."""
+    conn = pg_connection()
+    try:
+        return slim_registry(conn)
+    finally:
+        conn.close()
 
 
 def _read_chain_ids(conn, source_table: str, payer_id: str,
@@ -282,6 +293,7 @@ async def _extract_and_load(
     sem: asyncio.Semaphore,
     upsert: bool = False,
     resume: bool = False,
+    allow_slim: bool = False,
 ) -> dict:
     async with sem:
         settings = get_settings()
@@ -319,7 +331,11 @@ async def _extract_and_load(
                     state["transform_errors"] += 1
                     log.debug("transform failed: %s: %s", type(exc).__name__, exc)
             try:
-                n = upsert_batch(conn, table, rows, update=upsert)
+                # allow_slim must reach the backstop: when the operator forces a
+                # slim unit (--allow-slim-upsert), run_etl un-skips it, and
+                # without the flag here the backstop would kill the unit at its
+                # very first batch — after the extraction already ran.
+                n = upsert_batch(conn, table, rows, update=upsert, allow_slim=allow_slim)
                 state["rows_committed"] += len(rows)
                 # Checkpoint in the SAME transaction as the batch, so it can never
                 # name data that isn't durable. SAVEPOINT-fenced: failure loses the
@@ -394,6 +410,24 @@ async def _harvest_one(session, ep: Endpoint, base_resource: str, cfg: dict, max
         rt = _INCLUDE_TARGET.get(inc.split(":", 1)[1])
         if rt:
             target_types.add(rt)
+
+    # Slim tables must not receive full resources even through the harvest's
+    # DO NOTHING inserts: every NEW id would land with full JSON next to the
+    # stubs, scoring the two on different bases. The upsert_batch backstop only
+    # covers update=True, so the harvest has to check for itself here.
+    slim = await asyncio.to_thread(_load_slim_units)
+    if (ep.key, base_resource) in slim:
+        log.warning("harvest %s: base resource %s is a slim table; skipping the "
+                    "sweep (re-load it from its raw archive instead)",
+                    ep.key, base_resource)
+        return {}
+    slim_targets = {rt for rt in target_types if (ep.key, rt) in slim}
+    if slim_targets:
+        # MultiSink drops resource types it has no flusher for, so removing the
+        # table here cleanly discards the harvested copies of slim resources.
+        log.warning("harvest %s: dropping slim table target(s) %s from the sweep",
+                    ep.key, sorted(slim_targets))
+        target_types -= slim_targets
 
     schema = schema_for(ep.key)
     ensure_payer_schema(schema)
@@ -496,6 +530,7 @@ async def run_etl(
     upsert: bool = False,
     resume: bool = False,
     settings: Optional[Settings] = None,
+    allow_slim: bool = False,
 ) -> dict:
     settings = settings or get_settings()
     manifest = load_manifest()
@@ -520,38 +555,56 @@ async def run_etl(
     for ep in runnable:
         ensure_payer_schema(schema_for(ep.key))
 
+    # Slim tables hold a stub `resource` with the real JSON archived on disk, so
+    # any pull that would write full resources into one is refused here -- before
+    # hours of extraction, rather than at the first batch. Skipping (not raising)
+    # keeps a monthly all-payer run from failing wholesale over one unit, and the
+    # reason lands in the summary. loader.upsert_batch backstops this.
+    slim = set() if allow_slim else _load_slim_units()
+
     sem = asyncio.Semaphore(concurrency)
     tasks = []
+    # (payer, resource) per task, in task order. The grouping below used to
+    # re-derive this by replaying the same nested loop and indexing results
+    # positionally, which silently desynchronizes the moment anything is skipped
+    # inside the loop. Recording it once, here, keeps the two in step by
+    # construction.
+    task_units: list[tuple[str, str]] = []
     async with FhirSession(settings) as session:
         for ep in runnable:
             expected = ep.expected_resources(manifest.plannet_resources)
             rtypes = [r for r in expected if (not resources or r in resources)]
             for rtype in rtypes:
-                tasks.append(_extract_and_load(session, ep, rtype, max_pages, sem, upsert, resume))
+                if (ep.key, rtype) in slim:
+                    log.warning(
+                        "SKIPPING %s/%s: registered as a slim table (stub `resource`, "
+                        "raw JSON on disk). Loading it here would re-inflate the "
+                        "table and mix full with stub rows. Re-load from the raw "
+                        "archive instead, or pass --allow-slim-upsert to override.",
+                        ep.key, rtype)
+                    skipped.append({"key": ep.key, "resource": rtype,
+                                    "reason": "slim-table"})
+                    continue
+                tasks.append(_extract_and_load(session, ep, rtype, max_pages, sem,
+                                               upsert, resume, allow_slim))
+                task_units.append((ep.key, rtype))
         # return_exceptions: one unit blowing up (a DB error outside the inner
         # guards, say) must not discard every other unit's work AND the summary.
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+    # Pair each result with the unit that produced it (gather preserves task
+    # order, so this is positional by construction — strict= turns any drift
+    # between the two lists into a loud error instead of silent truncation).
     results = []
-    for r in raw_results:
+    by_payer: dict[str, list[dict]] = {ep.key: [] for ep in runnable}
+    for (payer_key, rtype), r in zip(task_units, raw_results, strict=True):
         if isinstance(r, BaseException):
-            log.error("extract unit failed: %s: %s", type(r).__name__, r)
-            results.append({"status": "error", "loaded": 0, "resource_type": None,
-                            "payer": None, "note": f"{type(r).__name__}: {r}"})
-        else:
-            results.append(r)
-
-    # Group results by payer.
-    by_payer: dict[str, list[dict]] = {}
-    for ep in runnable:
-        by_payer[ep.key] = []
-    idx = 0
-    for ep in runnable:
-        expected = ep.expected_resources(manifest.plannet_resources)
-        rtypes = [r for r in expected if (not resources or r in resources)]
-        for _ in rtypes:
-            by_payer[ep.key].append(results[idx])
-            idx += 1
+            log.error("extract unit %s/%s failed: %s: %s",
+                      payer_key, rtype, type(r).__name__, r)
+            r = {"status": "error", "loaded": 0, "resource_type": rtype,
+                 "payer": payer_key, "note": f"{type(r).__name__}: {r}"}
+        results.append(r)
+        by_payer[payer_key].append(r)
 
     total_loaded = sum(r.get("loaded", 0) for r in results)
     summary = {

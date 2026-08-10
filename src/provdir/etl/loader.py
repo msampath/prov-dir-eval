@@ -13,6 +13,7 @@ arrays/timestamps adapt natively.
 from __future__ import annotations
 
 import re
+import time
 from typing import Iterable, Optional
 
 import psycopg
@@ -22,6 +23,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 from ..config import get_settings
 from ..logging_setup import get_logger
+from ..models import RESOURCE_TYPE_BY_TABLE
 
 log = get_logger(__name__)
 
@@ -114,6 +116,130 @@ def bulk_load(conn: psycopg.Connection, table: Table, rows: Iterable[dict]) -> i
     return n
 
 
+class SlimTableError(RuntimeError):
+    """Raised when a writer would put full resources into a slim table."""
+
+
+# Process-local cache of the slim registry, TTL-bounded. The --slim loader
+# registers BEFORE its first write and refuses to start while other backends
+# hold locks on the table, so the only staleness that can matter is a
+# long-lived process (an orchestrator parent, a monthly etl run) that cached
+# the registry before a slim load registered elsewhere — or cached the
+# missing-table empty set before a migration created public.slim_table. A
+# cache that never expired would carry that stale answer for the life of the
+# process; the TTL bounds it to minutes, while a slim load needs hours before
+# the table is meaningfully stubbed.
+_slim_cache: Optional[set[tuple[str, str]]] = None
+_slim_cache_at: float = 0.0
+_SLIM_CACHE_TTL_S = 300.0
+
+
+def refresh_slim_registry() -> None:
+    global _slim_cache
+    _slim_cache = None
+
+
+def slim_registry(conn: psycopg.Connection) -> set[tuple[str, str]]:
+    """(payer_id, resource_type) pairs stored in slim form. Empty if the registry
+    table does not exist yet, so this is safe to call against an old database."""
+    global _slim_cache, _slim_cache_at
+    if _slim_cache is not None and time.monotonic() - _slim_cache_at < _SLIM_CACHE_TTL_S:
+        return _slim_cache
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = 'slim_table'"
+        )
+        if cur.fetchone() is None:
+            # Fail-open on purpose: a fresh clone / CI database legitimately has
+            # no registry (and nothing slim to protect). Loudly, though — on a
+            # database that HAS slim tables, a dropped registry silently
+            # disabling every guard must at least leave a trace in the logs.
+            log.warning("public.slim_table does not exist; slim-table write "
+                        "protection is inactive for this database")
+            _slim_cache = set()
+            _slim_cache_at = time.monotonic()
+            return _slim_cache
+        cur.execute("SELECT payer_id, resource_type FROM public.slim_table")
+        _slim_cache = {(r[0], r[1]) for r in cur.fetchall()}
+        _slim_cache_at = time.monotonic()
+    return _slim_cache
+
+
+def slim_reason(conn: psycopg.Connection, payer_id: str, resource_type: str) -> Optional[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT reason, raw_location FROM public.slim_table "
+            "WHERE payer_id = %s AND resource_type = %s",
+            (payer_id, resource_type),
+        )
+        r = cur.fetchone()
+    if not r:
+        return None
+    return f"{r[0]}" + (f" (raw JSON lives at {r[1]})" if r[1] else "")
+
+
+def register_slim_table(conn: psycopg.Connection, payer_id: str, resource_type: str,
+                        reason: str, raw_location: Optional[str] = None) -> None:
+    """Record that (payer, resource) is stored in slim form.
+
+    Does NOT commit — run it on an autocommit connection (or commit before the
+    load starts): a registration that rolls back with a failed transaction is a
+    protection that silently never existed.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO public.slim_table "
+            "(payer_id, resource_type, reason, raw_location) VALUES (%s, %s, %s, %s) "
+            "ON CONFLICT (payer_id, resource_type) DO UPDATE SET "
+            "reason = EXCLUDED.reason, raw_location = EXCLUDED.raw_location, "
+            "registered_at = now()",
+            (payer_id, resource_type, reason, raw_location),
+        )
+    refresh_slim_registry()
+
+
+def unregister_slim_table(conn: psycopg.Connection, payer_id: str,
+                          resource_type: str) -> bool:
+    """Remove a slim registration once the table holds FULL resources again
+    (i.e. a full-fidelity replace load completed) — otherwise the stale row
+    would keep freezing a genuinely-full table out of orchestrated pulls and
+    upserts forever. Returns whether a row was removed. Does NOT commit — same
+    autocommit-connection expectation as register_slim_table.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM public.slim_table "
+            "WHERE payer_id = %s AND resource_type = %s",
+            (payer_id, resource_type),
+        )
+        removed = cur.rowcount > 0
+    refresh_slim_registry()
+    return removed
+
+
+def assert_not_slim(conn: psycopg.Connection, payer_id: str, resource_type: str,
+                    allow_slim: bool = False, what: str = "this load") -> None:
+    """Refuse to write full resources into a slim table.
+
+    Call this EARLY -- at the top of a load, before hours of extraction -- so the
+    operator gets the refusal up front rather than after the work is done. The
+    same check also sits inside upsert_batch(update=True) as the backstop that
+    catches writers which forgot to call this one.
+    """
+    if allow_slim or (payer_id, resource_type) not in slim_registry(conn):
+        return
+    raise SlimTableError(
+        f"{payer_id}/{resource_type} is registered as a SLIM table: "
+        f"{slim_reason(conn, payer_id, resource_type)}. {what} would write full "
+        "`resource` JSON into it, re-inflating a table that was deliberately "
+        "loaded without it (and mixing full with stub rows, which breaks "
+        "completeness scoring). Re-extract from the raw archive with "
+        "bulk_replace_load.py --slim instead, or pass the explicit allow-slim "
+        "override if you have verified there is room for the full resources."
+    )
+
+
 _STAGE = "_provdir_stage"
 
 
@@ -130,7 +256,8 @@ def prepare_stage(conn: psycopg.Connection, table: Table) -> None:
     conn.commit()
 
 
-def upsert_batch(conn: psycopg.Connection, table: Table, rows: list[dict], update: bool = False) -> int:
+def upsert_batch(conn: psycopg.Connection, table: Table, rows: list[dict],
+                 update: bool = False, allow_slim: bool = False) -> int:
     """COPY rows into the stage, then INSERT ... ON CONFLICT (payer_id,id).
 
     Default (``update=False``): ``DO NOTHING`` — existing ids are skipped, so a
@@ -146,6 +273,20 @@ def upsert_batch(conn: psycopg.Connection, table: Table, rows: list[dict], updat
     """
     if not rows:
         return 0
+    if update and not allow_slim:
+        # Backstop, not the primary guard: callers should assert_not_slim() up
+        # front. This catches the writer that didn't -- including scripts written
+        # later -- because DO UPDATE sets resource = EXCLUDED.resource, which is
+        # the one operation that can destroy a slim table. Derived from the rows
+        # rather than added to the signature so every existing caller is covered
+        # without touching it. Cheap: slim_registry is cached per process.
+        rtype = RESOURCE_TYPE_BY_TABLE.get(table.name)
+        if rtype:
+            # Every distinct payer in the batch, not rows[0] alone: nothing in
+            # this signature stops a future caller from batching across payers,
+            # and a guard that samples the first row would wave the rest through.
+            for payer in {r.get("payer_id") for r in rows} - {None}:
+                assert_not_slim(conn, payer, rtype, what="an upsert with update=True")
     cols = _copy_columns(table)
     types = [_copy_type(table.c[name]) for name in cols]
     col_list = ", ".join(f'"{c}"' for c in cols)

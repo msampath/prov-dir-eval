@@ -44,7 +44,7 @@ sys.path.insert(0, str(REPO / "src"))
 from provdir.config import get_settings, load_manifest              # noqa: E402
 from provdir.etl.loader import (                                    # noqa: E402
     count_rows, insert_provenance, latest_prior_count, pg_connection,
-    prepare_stage, schema_for, upsert_batch,
+    assert_not_slim, prepare_stage, schema_for, upsert_batch,
 )
 from provdir.etl.transform import TransformError, transform_resource  # noqa: E402
 from provdir.models import RESOURCE_TABLES                          # noqa: E402
@@ -446,6 +446,9 @@ def run_ingest_local(payer, rtype, base, table, schema, path) -> int:
     """Phase 2: ingest a captured local ndjson file into Postgres (no network)."""
     started = datetime.now(tz=timezone.utc)
     conn = pg_connection(schema)
+    # Refuse before reading a multi-hundred-GB file: this path upserts with
+    # update=True, which on a slim table would overwrite every stub `resource`.
+    assert_not_slim(conn, payer, rtype, what="a local ndjson ingest")
     prepare_stage(conn, table)
     batch: list[dict] = []
     total = 0
@@ -558,6 +561,7 @@ def main() -> int:
         # fresh token for the (potentially multi-day) download phase
         auth_holder["h"] = mint_auth(payer)
         conn = pg_connection(schema)
+        assert_not_slim(conn, payer, rtype, what="a streaming bulk-export ingest")
         prepare_stage(conn, table)
         batch: list[dict] = []
         fi = 0

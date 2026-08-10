@@ -214,6 +214,29 @@ extract_checkpoint = Table(
     Column("updated_at", DateTime(timezone=True), server_default=func.now(), nullable=False),
 )
 
+# Registry of (payer, resource) tables loaded in SLIM form: the `resource` JSONB
+# holds only a stub and the real FHIR JSON lives in an ndjson archive on disk.
+# This exists because slimness is invisible from the schema -- the column is
+# populated and NOT NULL either way -- yet it changes what may be written. An
+# upsert with update=True sets `resource = EXCLUDED.resource`, which on
+# aetna_cvs.PractitionerRole would try to re-inflate ~500M stub rows toward
+# ~1.3 TB on a volume with far less free space, and would silently mix full and
+# stub rows (so completeness scoring would compare payers on different bases).
+# scripts/bulk_replace_load.py --slim registers a row here BEFORE it starts
+# loading (the hazard is live from the first truncate), and its full-fidelity
+# mode removes the row after a completed reload; loader.assert_not_slim /
+# upsert_batch refuse to write unless forced.
+slim_table = Table(
+    "slim_table",
+    shared_metadata,
+    Column("payer_id", Text, primary_key=True),
+    Column("resource_type", Text, primary_key=True),
+    Column("reason", Text, nullable=False),
+    Column("raw_location", Text),               # where the real JSON actually is
+    Column("registered_at", DateTime(timezone=True),
+           server_default=func.now(), nullable=False),
+)
+
 # resource_type (FHIR) -> table mapping used by the ETL loader.
 RESOURCE_TABLES: dict[str, Table] = {
     "Organization": organization,
@@ -227,6 +250,12 @@ RESOURCE_TABLES: dict[str, Table] = {
 }
 
 RESOURCE_TABLE_NAMES = [t.name for t in RESOURCE_TABLES.values()]
+
+# table name -> FHIR resource_type, so a writer holding only a Table can name the
+# (payer, resource) pair the slim registry is keyed on.
+RESOURCE_TYPE_BY_TABLE: dict[str, str] = {
+    t.name: rt for rt, t in RESOURCE_TABLES.items()
+}
 
 # Injection-safety invariant: these table/column names are interpolated into SQL
 # strings across the ETL and quality modules. Assert at import that each is a strict

@@ -60,6 +60,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                        help="on (payer_id,id) conflict UPDATE the row (refresh changed records) instead of skipping")
     p_etl.add_argument("--resume", action="store_true",
                        help="resume bare pagination from the last committed checkpoint (offset servers; 72h TTL)")
+    p_etl.add_argument("--allow-slim-upsert", action="store_true",
+                       help="load payer/resource pairs registered in public.slim_table, "
+                            "which are skipped by default. Those tables store a stub "
+                            "`resource` with the real JSON archived on disk; loading "
+                            "them here writes full resources back in, re-inflating the "
+                            "table (aetna_cvs/PractitionerRole: ~500M rows toward "
+                            "~1.3 TB) and mixing full with stub rows. Only use this "
+                            "after confirming the storage exists.")
 
     sub.add_parser("coverage", help="per-(payer, resource) extraction coverage scoreboard")
     sub.add_parser("status-dashboard", help="build the collection-status dashboard (payer x resource coverage)")
@@ -130,6 +138,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 resources=resources,
                 upsert=args.upsert,
                 resume=args.resume,
+                allow_slim=args.allow_slim_upsert,
             )
         )
         return 0 if summary.get("ok") else 1

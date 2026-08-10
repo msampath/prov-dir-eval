@@ -105,7 +105,8 @@ sys.path.insert(0, str(REPO / "src"))
 
 from provdir.config import get_settings, load_manifest              # noqa: E402
 from provdir.etl.loader import (                                    # noqa: E402
-    bulk_load, insert_provenance, pg_connection, schema_for, truncate,
+    bulk_load, insert_provenance, pg_connection, register_slim_table, schema_for,
+    truncate, unregister_slim_table,
 )
 from provdir.etl.transform import TransformError, transform_resource  # noqa: E402
 from provdir.models import RESOURCE_TABLES                          # noqa: E402
@@ -1166,6 +1167,17 @@ def run_slim(args: argparse.Namespace, table, schema: str, base_url: str,
         slim_started = True
         ensure_done_table(ddl_conn)
 
+        # Register BEFORE loading, not after. The hazard is live the moment the
+        # table stops holding full resources, and a run that dies mid-load still
+        # leaves a table full of stubs that an --upsert would re-inflate. Late
+        # registration would leave exactly that window unguarded.
+        register_slim_table(
+            ddl_conn, PAYER, RTYPE,
+            reason=("loaded structured-columns-only by bulk_replace_load.py --slim; "
+                    "`resource` holds a stub, not the full FHIR JSON"),
+            raw_location=str(Path(args.source_dir)),
+        )
+
         if not args.resume:
             print(f"WARNING: TRUNCATING {schema}.{table.name} ({before:,} rows), "
                   f"moving heap to {SLIM_TABLESPACE}, DROPPING indexes "
@@ -1467,6 +1479,15 @@ def run_full(args: argparse.Namespace, table, schema: str, base_url: str,
             "pct_change": round(100.0 * (after - before) / before, 1) if before else None,
             "notes": notes,
         })
+
+        # This run put FULL resources back (truncate + full-fidelity reload), so
+        # a lingering slim registration would wrongly freeze the table out of
+        # orchestrated pulls and upserts forever. NOT under --rebuild-only: that
+        # path never loaded rows, so it cannot know the heap is full-fidelity
+        # (it could follow a --slim run whose index rebuild failed).
+        if not args.rebuild_only and unregister_slim_table(ddl_conn, PAYER, RTYPE):
+            print(f"removed slim registration for {PAYER}/{RTYPE} "
+                  "(table holds full resources again)", flush=True)
 
         elapsed = time.time() - started.timestamp()
         print(f"DONE {PAYER}/{RTYPE}: files={len(files)} total_lines={total_lines:,} "

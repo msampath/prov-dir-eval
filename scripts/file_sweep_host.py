@@ -25,22 +25,20 @@ from sqlalchemy import text                    # noqa: E402
 # Sources with incomplete pulls (Endpoint-only and already-handled elevance/aetna
 # excluded). Each is swept for every resource type it serves, minus Endpoint.
 PAYERS = [
-    "premera", "hap", "devoted", "christus", "kaiser", "amerihealth_laex",
-    "regence", "medica", "capital_blue", "humana", "uhc_optum", "uhc",
+    "premera", "hap", "devoted", "christus", "amerihealth_laex",
+    "capital_blue", "uhc_optum",
     "amerihealth_deex", "amerihealth_flex", "amerihealth_ncex", "amerihealth_scex",
-    "bcbs_ks", "bcbs_la", "excellus", "hcsc", "mihin_bcbsm", "mihin_mdhhs",
-    "mvphealthcare", "vermont_blue_advantage", "bcbs_mn",
+    "bcbs_la", "hcsc", "mihin_bcbsm", "mihin_mdhhs",
+    "vermont_blue_advantage", "bcbs_mn",
     "bcbs_az",  # re-pull to file: PractitionerRole suspected over-corrected low (99k)
-    "dean_healthsparq", "health_advantage_ar",  # reference-graph sources, force bare
 ]
 
-# Reference-graph sources (id_chain / id_read / _include harvest in config). Per
-# user: try plain BARE search to file for these instead of the reference-graph
-# logic (validated on kaiser PractitionerRole: bare works, server_total 531,619).
-REFGRAPH = {
-    "humana", "excellus", "bcbs_ks", "mvphealthcare", "regence", "medica",
-    "dean_healthsparq", "health_advantage_ar", "kaiser", "uhc",
-}
+# The reference-graph sources (humana, excellus, bcbs_ks, mvphealthcare, regence,
+# medica, dean_healthsparq, health_advantage_ar, kaiser, uhc) were dropped from the
+# file sweep: force-bare proved INSUFFICIENT for them (server caps bare pagination
+# far below the real totals, e.g. regence Location 47k/5.5M), so their DB
+# reference-graph / adaptive pulls remain authoritative. Empty set => no force-bare.
+REFGRAPH: set[str] = set()
 OUT_ROOT = r"I:\file_export"
 # dependency-friendly order (chain sources before their dependents)
 RES_ORDER = ["InsurancePlan", "Organization", "Location", "HealthcareService",

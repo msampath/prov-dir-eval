@@ -66,13 +66,33 @@ GRACE_OVERRIDES: dict = {
     "kaiser": 2400,
 }
 
-# (payer, resource) units to never run. Aetna PractitionerRole is evidence-frozen
-# pending Aetna's reply on its implausible ~380M count; navitus is an out-of-scope
-# PBM pharmacy directory. "*" excludes the whole payer.
+# (payer, resource) units to never run. Aetna PractitionerRole is additionally a
+# slim table (see slim_exclusions below); navitus is an out-of-scope PBM pharmacy
+# directory. "*" excludes the whole payer.
 EXCLUSIONS: dict = {
     "aetna_cvs": {"PractitionerRole"},
     "navitus": {"*"},
 }
+
+
+def slim_exclusions() -> dict:
+    """Units excluded because the table stores a stub `resource`, read live from
+    public.slim_table rather than hardcoded here.
+
+    A hardcoded list is exactly the wrong shape for this: the next slim load
+    would silently NOT be excluded, and the orchestrator would re-inflate it.
+    Reading the registry means registering a slim table is enough.
+    """
+    from provdir.etl.loader import pg_connection, slim_registry
+
+    out: dict = {}
+    conn = pg_connection()
+    try:
+        for payer, rtype in slim_registry(conn):
+            out.setdefault(payer, set()).add(rtype)
+    finally:
+        conn.close()
+    return out
 
 # Resource order within a payer: sources before the resources that chain off them.
 RESOURCE_ORDER = [
@@ -251,6 +271,7 @@ def build_plan(args) -> tuple:
     lanes: dict = {}
     lane_hosts: dict = {}
     skipped: list = []
+    _slim_excl = slim_exclusions()
 
     for ep in endpoints:
         if args.only and ep.key != args.only:
@@ -261,7 +282,7 @@ def build_plan(args) -> tuple:
             skipped.append({"payer": ep.key, "resource": "*", "outcome": "skipped-unrunnable",
                             "reason": reason})
             continue
-        excl = EXCLUSIONS.get(ep.key, set())
+        excl = EXCLUSIONS.get(ep.key, set()) | _slim_excl.get(ep.key, set())
         if "*" in excl:
             skipped.append({"payer": ep.key, "resource": "*", "outcome": "skipped-excluded"})
             continue
