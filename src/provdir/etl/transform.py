@@ -262,8 +262,19 @@ class TransformError(Exception):
     pass
 
 
-def transform_resource(resource: dict, payer_id: str, source_base_url: str) -> dict:
-    """Build a full DB row (common + extracted columns) for a FHIR resource."""
+def transform_resource(resource: dict, payer_id: str, source_base_url: str,
+                       raw_hash: Optional[str] = None) -> dict:
+    """Build a full DB row (common + extracted columns) for a FHIR resource.
+
+    ``raw_hash`` defaults to :func:`sha256_hash` of the parsed resource, i.e. a
+    hash over its *canonical* (key-sorted) serialization, so the same resource
+    hashes identically regardless of the key order the server sent. Callers that
+    already hold the exact source bytes may pass their own digest instead;
+    ``sha256_hash`` re-serializes the whole dict and costs ~98us/row, which
+    dominates bulk loads of hundreds of millions of rows. A caller-supplied hash
+    is only comparable with other hashes computed the same way -- see
+    ``scripts/bulk_replace_load.py --slim``, which hashes the raw ndjson line.
+    """
     rtype = resource.get("resourceType")
     extractor = _EXTRACTORS.get(rtype)
     if extractor is None:
@@ -277,7 +288,7 @@ def transform_resource(resource: dict, payer_id: str, source_base_url: str) -> d
         "id": rid,
         "source_base_url": source_base_url,
         "resource": resource,
-        "raw_hash": sha256_hash(resource),
+        "raw_hash": sha256_hash(resource) if raw_hash is None else raw_hash,
         "meta_last_updated": parse_last_updated(resource),
         # Stamped every (re)upsert; must be set here, not via a column default —
         # binary COPY writes NULL for keys absent from the row dict, and
