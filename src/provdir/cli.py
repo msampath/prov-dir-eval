@@ -89,7 +89,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                              "(F:/fhir_val_keep is always also searched)")
     p_elem.add_argument("--resume-run", type=int, default=None,
                         help="continue an existing element_coverage_run id, "
-                             "skipping payers already recorded under it")
+                             "skipping (payer, assessment) pairs already recorded")
+    p_elem.add_argument("--auto-resume", action="store_true",
+                        help="resume the newest UNFINISHED run if there is one, "
+                             "else start fresh (for detached launchers)")
 
     sub.add_parser("score", help="Phase 7 compute composite data-quality scores")
     sub.add_parser("dashboard", help="Phase 7 build the static site")
@@ -244,10 +247,29 @@ def main(argv: Optional[list[str]] = None) -> int:
             assessments["plannet_ext"] = PLANNET_EXT_CHECKS
             meta["plannet_ext"] = {"attribution": PLANNET_EXT_ATTRIBUTION}
 
+        resume_run = args.resume_run
+        if args.auto_resume and not resume_run:
+            # A detached launcher would otherwise silently restart a multi-hour
+            # sweep from the first payer after any interruption.
+            from .etl.loader import pg_connection as _pg
+            _c = _pg()
+            try:
+                with _c.cursor() as _cur:
+                    _cur.execute("SELECT max(run_id) FROM public.element_coverage_run "
+                                 "WHERE finished_at IS NULL")
+                    _r = _cur.fetchone()
+                resume_run = _r[0] if _r and _r[0] else None
+            finally:
+                _c.close()
+            if resume_run:
+                print(f"--auto-resume: picked up unfinished run {resume_run}")
+            else:
+                print("--auto-resume: no unfinished run; starting fresh")
+
         summary = run_element_coverage(
             assessments, keys=keys,
             sample_root=[args.sample_root, "F:/fhir_val_keep"],
-            resume_run=args.resume_run, meta=meta,
+            resume_run=resume_run, meta=meta,
             assessment_payers=assessment_payers or None,
         )
         print(f"element_coverage run {summary['run_id']}: {len(summary['payers'])} payer(s) measured")

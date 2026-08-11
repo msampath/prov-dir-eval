@@ -194,6 +194,14 @@ def build_chunks(sample_dir: Path, chunk_size: int) -> list[tuple[str, Path]]:
 def run_chunk(cell: str, chunk_dir: Path, sample_dir: Path, args,
               out_dir: Path) -> tuple[str, Path, int, str]:
     out_file = out_dir / f"{chunk_dir.name}.json"
+    if args.reuse_outputs and out_file.exists() and out_file.stat().st_size > 0:
+        # Resume: this chunk already produced output in an earlier attempt.
+        # Chunk names are deterministic (sorted cell dirs, fixed chunk size),
+        # so `<cell>__NNN.json` identifies the same file set across runs. The
+        # DB load at the end reads every output present, so reusing here yields
+        # exactly the same rows as re-validating -- for ~10 min of GPU-less
+        # JVM time per chunk saved.
+        return cell, out_file, 0, "(reused existing output)"
     rel_chunk = f"/data/_batches/{chunk_dir.name}"
     rel_out = f"/data/_out/{out_file.name}"
     mounts = [
@@ -332,6 +340,12 @@ def main() -> int:
                           "validator once stalled a run for 6h). The chunk is "
                           "recorded failed; the rest of the run continues. "
                           "Default: %(default)s")
+    ap.add_argument("--reuse-outputs", action="store_true",
+                     help="resume: keep _out/ and skip any chunk whose output "
+                          "file already exists. Chunk names are deterministic, "
+                          "so a re-run after a crash re-validates only what is "
+                          "missing instead of all ~46 chunks. Safe to leave on: "
+                          "the end-of-run DB load reads every output present.")
     ap.add_argument("--restore-from", default="F:/fhir_val_keep",
                      help="backup of the sample (in _batches chunk-dir layout) "
                           "to COPY back if the sample dir turns up empty. "
@@ -345,9 +359,12 @@ def main() -> int:
         raise SystemExit(f"sample dir not found: {sample_dir}")
 
     out_dir = sample_dir / "_out"
-    if out_dir.exists():
+    if out_dir.exists() and not args.reuse_outputs:
+        # Wiped by default so a fresh run cannot silently inherit a previous
+        # run's outputs. --reuse-outputs is precisely the opt-in to that
+        # inheritance, and must therefore NOT wipe.
         shutil.rmtree(out_dir)
-    out_dir.mkdir()
+    out_dir.mkdir(exist_ok=True)
 
     # Top up the sample from the backup copy UNCONDITIONALLY, not only when
     # the sample dir looks empty: restore_from_backup is incremental (it

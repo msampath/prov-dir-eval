@@ -245,6 +245,11 @@ def main() -> int:
     ap.add_argument("--run-id", type=int,
                     help="resume this run_id: (payer,resource_type,element) triples "
                          "already recorded are skipped")
+    ap.add_argument("--auto-resume", action="store_true",
+                    help="resume the newest UNFINISHED run if there is one, else "
+                         "start fresh. Intended for a detached/scheduled launcher, "
+                         "which otherwise silently restarts a multi-hour sweep "
+                         "from payer 1 after any interruption.")
     ap.add_argument("--cache", default=str(bindings.DEFAULT_CACHE),
                     help="FHIR package cache root (default: %(default)s)")
     ap.add_argument("--dry-run", action="store_true",
@@ -276,6 +281,18 @@ def main() -> int:
 
     payers = sorted(args.payers.split(",")) if args.payers else sorted(list_payer_schemas(conn))
     print(f"{len(payers)} payer(s): {payers}", flush=True)
+
+    if args.auto_resume and not args.run_id:
+        with conn.cursor() as cur:
+            cur.execute("SELECT max(run_id) FROM public.binding_check_run "
+                        "WHERE finished_at IS NULL")
+            r = cur.fetchone()
+        if r and r[0]:
+            args.run_id = r[0]
+            print(f"--auto-resume: picked up unfinished run_id={args.run_id}",
+                  flush=True)
+        else:
+            print("--auto-resume: no unfinished run; starting fresh", flush=True)
 
     if args.run_id:
         run_id = args.run_id
