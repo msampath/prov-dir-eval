@@ -1021,11 +1021,21 @@ def run_parallel_workers(args: argparse.Namespace, schema: str, files: list[Path
               f"{[p.pid for p in procs]}); supervising, free-space check every "
               f"{PROBE_INTERVAL_SEC}s", flush=True)
 
+        def poll_all() -> list:
+            """Poll EVERY child, not just up to the first live one.
+
+            ``any(p.poll() is None for p in procs)`` short-circuits, so with w0
+            still running none of w1..wN were ever polled and their
+            ``returncode`` stayed None -- the dead-child check below could
+            therefore never fire while the longest-running shard was alive,
+            which is the whole load.
+            """
+            return [p.poll() for p in procs]
+
         next_probe = time.time() + PROBE_INTERVAL_SEC
-        while any(p.poll() is None for p in procs):
+        while any(code is None for code in poll_all()):
             time.sleep(5)
-            dead = [(i, p.returncode) for i, p in enumerate(procs)
-                    if p.returncode not in (None, 0)]
+            dead = [(i, c) for i, c in enumerate(poll_all()) if c not in (None, 0)]
             if dead:
                 aborting = ("child failure: " +
                             ", ".join(f"w{i} exited {c}" for i, c in dead))
@@ -1243,6 +1253,14 @@ def run_slim(args: argparse.Namespace, table, schema: str, base_url: str,
             print("all files already recorded done; skipping straight to "
                   "index rebuild.", flush=True)
 
+        # Fresh session for the rebuild, same reasoning as the full path. Swap
+        # BEFORE the coverage gate: ddl_conn idled through the entire multi-hour
+        # load, so querying it here could fail on a dropped connection and
+        # strand a fully loaded but unindexed table -- exactly what the swap
+        # exists to prevent.
+        ddl_conn.close()
+        ddl_conn = rebuild_connection(schema)
+
         # Coverage gate. A child can legitimately decline a file (claim_file
         # loses the advisory lock to a stray process) and still exit 0, and a
         # single-process run can hit the same case. Rebuilding now would stamp
@@ -1258,10 +1276,6 @@ def run_slim(args: argparse.Namespace, table, schema: str, base_url: str,
                 "rebuild indexes or write provenance on an incomplete load. "
                 "Check for a stray loader process, then re-run --slim --resume."
             )
-
-        # Fresh session for the rebuild, same reasoning as the full path.
-        ddl_conn.close()
-        ddl_conn = rebuild_connection(schema)
 
         print(f"rebuilding indexes on {INDEX_TABLESPACE}...", flush=True)
         try:

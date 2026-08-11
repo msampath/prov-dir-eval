@@ -79,6 +79,18 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_qual = sub.add_parser("quality", help="Phase 6 conformance + referential integrity")
     p_qual.add_argument("--subset", help="comma-separated endpoint keys")
 
+    p_elem = sub.add_parser("element-coverage",
+                            help="Phase 4 USCDI v3 / MPF / Plan-Net-extensions element coverage")
+    p_elem.add_argument("--assessment", default="all",
+                        choices=["uscdi", "mpf", "plannet-ext", "all"])
+    p_elem.add_argument("--subset", help="comma-separated endpoint keys")
+    p_elem.add_argument("--sample-root", default="F:/fhir_val",
+                        help="root searched for slim-table sample files "
+                             "(F:/fhir_val_keep is always also searched)")
+    p_elem.add_argument("--resume-run", type=int, default=None,
+                        help="continue an existing element_coverage_run id, "
+                             "skipping payers already recorded under it")
+
     sub.add_parser("score", help="Phase 7 compute composite data-quality scores")
     sub.add_parser("dashboard", help="Phase 7 build the static site")
 
@@ -170,6 +182,75 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         keys = _split_keys(args.subset)
         run_quality(keys=keys)
+        return 0
+
+    if args.command == "element-coverage":
+        from .config import load_manifest
+        from .etl.loader import pg_connection
+        from .quality.element_coverage import run_element_coverage
+        from .quality.mpf import (
+            MPF_CALLOUTS, MPF_CHECKS, MPF_SOURCE_PROVENANCE, PLANNET_EXT_ATTRIBUTION,
+            PLANNET_EXT_CHECKS, classify_ma,
+        )
+        from .quality.uscdi import USCDI_CHECKS, USCDI_ELEMENT_META
+
+        keys = _split_keys(args.subset)
+        want = ({"uscdi", "mpf", "plannet_ext"} if args.assessment == "all"
+               else {args.assessment.replace("-", "_")})
+
+        assessments: dict = {}
+        meta: dict = {}
+        assessment_payers: dict = {}
+
+        if "uscdi" in want:
+            assessments["uscdi"] = USCDI_CHECKS
+            meta["uscdi"] = {
+                "disclaimer": (
+                    "No official USCDI v3 -> Plan-Net element mapping exists (US "
+                    "Core maps Care Team Member to CareTeam only, a resource "
+                    "Plan-Net does not define). Every element below is an "
+                    "inference; see each row's `mapping` label and "
+                    "uscdi.py's module docstring."
+                ),
+                "facility_note": "USCDI v3 has no Facility class (that arrives in USCDI v4+).",
+                "source": "USCDI v3.1 (June 2025); certification baseline Jan 1 2026 "
+                          "(45 CFR 170.213, HTI-1).",
+                "element_meta": USCDI_ELEMENT_META,
+            }
+
+        if "mpf" in want:
+            manifest = load_manifest()
+            conn = pg_connection()
+            try:
+                ma_roster = classify_ma(conn, manifest)
+            finally:
+                conn.close()
+            print("=== MA classifier roster (payers with loaded schemas; "
+                  "manifest payers without data are not listed) ===")
+            for r in ma_roster:
+                flag = "MA" if r["classified"] else "--"
+                sigs = r["override"] or ", ".join(e["signal"] for e in r["evidence"]) or "(no signal)"
+                print(f"  [{flag}] {r['payer']:24s} {sigs}")
+            ma_keys = {r["payer"] for r in ma_roster if r["classified"]}
+            assessments["mpf"] = MPF_CHECKS
+            assessment_payers["mpf"] = ma_keys
+            meta["mpf"] = {
+                "source_provenance": MPF_SOURCE_PROVENANCE,
+                "callouts": MPF_CALLOUTS,
+                "ma_roster": ma_roster,
+            }
+
+        if "plannet_ext" in want:
+            assessments["plannet_ext"] = PLANNET_EXT_CHECKS
+            meta["plannet_ext"] = {"attribution": PLANNET_EXT_ATTRIBUTION}
+
+        summary = run_element_coverage(
+            assessments, keys=keys,
+            sample_root=[args.sample_root, "F:/fhir_val_keep"],
+            resume_run=args.resume_run, meta=meta,
+            assessment_payers=assessment_payers or None,
+        )
+        print(f"element_coverage run {summary['run_id']}: {len(summary['payers'])} payer(s) measured")
         return 0
 
     if args.command == "score":

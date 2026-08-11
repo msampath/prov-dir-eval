@@ -25,8 +25,14 @@ def _resource_query(table: str, rules) -> str:
     return f"SELECT count(*) AS total, {filters} FROM {table} WHERE payer_id = %s"
 
 
-def evaluate_resource(conn: psycopg.Connection, payer_id: str, resource_type: str) -> dict | None:
-    rules = RESOURCE_RULES.get(resource_type)
+def evaluate_resource(
+    conn: psycopg.Connection, payer_id: str, resource_type: str, rules=None
+) -> dict | None:
+    # Back-compat kwarg: callers measuring against a different rule table (e.g.
+    # element_coverage's assessments, which reuse this module's aggregate-query
+    # shape) can pass one in directly instead of only ever using
+    # RESOURCE_RULES[resource_type].
+    rules = rules if rules is not None else RESOURCE_RULES.get(resource_type)
     table = RESOURCE_TABLES.get(resource_type)
     if not rules or table is None:
         return None
