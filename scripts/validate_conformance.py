@@ -359,12 +359,34 @@ def main() -> int:
         raise SystemExit(f"sample dir not found: {sample_dir}")
 
     out_dir = sample_dir / "_out"
-    if out_dir.exists() and not args.reuse_outputs:
+    # Reuse is only sound for outputs produced by the SAME validator
+    # configuration. Reusing across configurations silently defeats the point
+    # of the new run: run 3 exists to re-validate WITH the THO package loaded,
+    # and had it inherited run 2's `-tx n/a`-without-THO outputs it would have
+    # been run 2's data under a new run_id, with the v2-0360 fix never applied
+    # and nothing in the results to show it. A sidecar marker makes that
+    # mismatch detectable instead of invisible.
+    config_sig = json.dumps({"ig": f"{IG}#{args.ig_version}",
+                             "tho": args.tho_version or None, "tx": args.tx},
+                            sort_keys=True)
+    marker = out_dir / "_config.json"
+    if out_dir.exists() and args.reuse_outputs:
+        prior = marker.read_text(encoding="utf-8") if marker.exists() else None
+        if prior != config_sig:
+            raise SystemExit(
+                f"FATAL: --reuse-outputs, but {out_dir} holds outputs from a "
+                f"different validator configuration.\n  existing: {prior or '(unmarked)'}"
+                f"\n  requested: {config_sig}\nReusing them would report the OLD "
+                "configuration's findings under a new run_id. Move or delete "
+                f"{out_dir} to re-validate from scratch."
+            )
+    elif out_dir.exists():
         # Wiped by default so a fresh run cannot silently inherit a previous
         # run's outputs. --reuse-outputs is precisely the opt-in to that
         # inheritance, and must therefore NOT wipe.
         shutil.rmtree(out_dir)
     out_dir.mkdir(exist_ok=True)
+    marker.write_text(config_sig, encoding="utf-8")
 
     # Top up the sample from the backup copy UNCONDITIONALLY, not only when
     # the sample dir looks empty: restore_from_backup is incremental (it

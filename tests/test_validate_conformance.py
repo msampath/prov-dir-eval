@@ -124,3 +124,39 @@ class TestBuildChunks:
         cell, d = chunks[0]
         assert cell == "Location"
         assert [f.name for f in d.glob("*.json")] == ["p__Location__0.json"]
+
+
+class TestReuseOutputsConfigGuard:
+    """--reuse-outputs must refuse outputs from a different validator config.
+
+    The concrete near-miss: run 3 exists to re-validate WITH the THO package
+    loaded. Launched with --reuse-outputs against run 2's leftover `-tx n/a`,
+    no-THO outputs, it would have reused all 33 of them -- publishing run 2's
+    findings under a new run_id with the v2-0360 fix never applied and nothing
+    in the results to reveal it.
+    """
+
+    def _args(self, tmp_path, **kw):
+        import argparse
+        d = dict(sample_dir=str(tmp_path), ig_version="1.1.0", tho_version="6.5.0",
+                 tx="n/a", reuse_outputs=True)
+        d.update(kw)
+        return argparse.Namespace(**d)
+
+    def _sig(self, args):
+        import json as _j
+        return _j.dumps({"ig": f"{vc.IG}#{args.ig_version}",
+                         "tho": args.tho_version or None, "tx": args.tx},
+                        sort_keys=True)
+
+    def test_signature_changes_with_tho(self, tmp_path):
+        with_tho = self._sig(self._args(tmp_path))
+        without = self._sig(self._args(tmp_path, tho_version=""))
+        assert with_tho != without, "THO must be part of the reuse signature"
+
+    def test_signature_changes_with_tx(self, tmp_path):
+        assert self._sig(self._args(tmp_path)) != self._sig(
+            self._args(tmp_path, tx="https://tx.fhir.org"))
+
+    def test_signature_stable_for_same_config(self, tmp_path):
+        assert self._sig(self._args(tmp_path)) == self._sig(self._args(tmp_path))
