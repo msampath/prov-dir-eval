@@ -203,19 +203,31 @@ endpoints:
     auth:
       strategy: none
     quirks:
-      # ~50k practitioners paginated via opaque ?q= tokens; _count=1000 pages
-      # are slow to generate and time out. Smaller pages are faster/stabler.
-      page_size: 250
-      # Bundle.link[next] dead-ends (page 2 empty), and large pages time out — but
-      # SMALL filtered buckets return their full set on page 1, fast (proven:
-      # family=aa -> 20 rows in 4.8s; family=smith=290 -> timeout). So adaptively
-      # subdivide name-bearing resources to <=50/bucket and take page 1 only.
-      # (PractitionerRole/OrganizationAffiliation lack a prefix param -> not reachable.)
-      adaptive:
-        Practitioner: {param: family, mode: prefix, bucket_max: 50, page1_only: true}
-        Organization: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
-        Location: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
-        HealthcareService: {param: name, mode: prefix, bucket_max: 50, page1_only: true}
+      # Opala fixed the continuation cursor (confirmed by the vendor and
+      # verified live 2026-08-11): following Bundle.link[next] as-issued now
+      # advances, 50 new records per page, correct resource type throughout,
+      # on all of Practitioner/Organization/Location/HealthcareService/
+      # PractitionerRole. The prefix-bucketing `adaptive` workaround that used
+      # to live here is therefore GONE -- it existed only because paging
+      # dead-ended at page 1, and it could never reach PractitionerRole or
+      # OrganizationAffiliation at all (no prefix-searchable param), which is
+      # why this payer had 167 PractitionerRole rows against a server total of
+      # 95,404. A plain bare walk is now both simpler and complete.
+      #
+      # 50, not 250: the server hard-caps _count at 50 and, when asked for
+      # more, appends an OperationOutcome entry to EVERY bundle
+      # ("Value '250' for '_count' is reduced to the configured maximum of
+      # 50"). Asking for exactly 50 gets the same 50 resources without an
+      # extra non-resource entry per page to filter out.
+      page_size: 50
+      # Still no bulk data: /$export, /Group/$export and /Practitioner/$export
+      # all return HTTP 501 "Argument is not supported", and the
+      # CapabilityStatement advertises no export/bulk/async operation. ~753k
+      # resources at 50/page = ~15k requests is the only route.
+      #
+      # Note the server also stopped returning Bundle.total on searches (it is
+      # available only via _summary=count), so page-count estimation must use
+      # the count endpoint rather than the first page's total.
 
   - key: banner
     payer_name: Banner Health

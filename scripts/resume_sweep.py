@@ -26,8 +26,12 @@ UNITS = [
     ("uhc_optum", "OrganizationAffiliation"),
     ("amerihealth_laex", "OrganizationAffiliation"), ("amerihealth_laex", "PractitionerRole"),
     ("devoted", "PractitionerRole"),
-    # premera PractitionerRole held out until 2026-08-21 (upstream fix pending);
-    # no point hammering it before the fix lands.
+    # premera: the upstream pagination fix landed EARLY (vendor-confirmed and
+    # verified live 2026-08-11), so the hold that kept it out of this list is
+    # lifted. PractitionerRole was unreachable before -- 167 rows against a
+    # 95,404 server total -- because the old prefix-bucket workaround had no
+    # prefix-searchable param for it.
+    ("premera", "PractitionerRole"),
     ("mihin_bcbsm", "Location"), ("mihin_bcbsm", "Organization"),
     ("mihin_bcbsm", "OrganizationAffiliation"), ("mihin_bcbsm", "Practitioner"),
     ("mihin_bcbsm", "PractitionerRole"),
