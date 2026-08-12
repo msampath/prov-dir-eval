@@ -160,3 +160,53 @@ class TestReuseOutputsConfigGuard:
 
     def test_signature_stable_for_same_config(self, tmp_path):
         assert self._sig(self._args(tmp_path)) == self._sig(self._args(tmp_path))
+
+
+class TestWorkerCacheIsolation:
+    """A shared package cache cannot survive concurrent validators: the cache
+    manager deletes and re-extracts package dirs with no cross-process lock, so
+    one container's cleanup walks a tree another is reading. 17 of 46 chunks
+    died together that way after warm-up had already proven the cache complete.
+    """
+
+    def test_each_worker_gets_a_distinct_path(self, tmp_path):
+        cache = tmp_path / "fhir_cache"
+        paths = [vc.worker_cache(cache, w) for w in range(14)]
+        assert len(set(paths)) == 14, "worker caches must not collide"
+        assert cache not in paths, "no worker may use the shared original"
+
+    def test_seeding_clones_and_is_idempotent(self, tmp_path):
+        cache = tmp_path / "fhir_cache"
+        (cache / "packages" / "pkg#1.0.0" / "package").mkdir(parents=True)
+        (cache / "packages" / "pkg#1.0.0" / "package" / "x.json").write_text("{}")
+
+        seeded = vc.seed_worker_caches(cache, 3)
+        assert len(seeded) == 3
+        for p in seeded:
+            assert (p / "packages" / "pkg#1.0.0" / "package" / "x.json").exists()
+
+        # Re-seeding must not raise (copytree would) and must not re-copy:
+        # a resumed run pays the clone cost only once.
+        marker = seeded[0] / "packages" / "pkg#1.0.0" / "package" / "x.json"
+        marker.write_text('{"touched": true}')
+        vc.seed_worker_caches(cache, 3)
+        assert marker.read_text() == '{"touched": true}'
+
+
+class TestOversizeBudget:
+    def test_one_oversize_file_per_chunk(self):
+        """Pairing whales just doubled what each timeout discarded: 13 Network
+        chunks of two 66k-address Organizations each still blew the 1h cap."""
+        assert vc.OVERSIZE_PER_CHUNK == 1
+
+    def test_oversize_chunks_are_tracked_for_the_longer_timeout(self, tmp_path):
+        cell = tmp_path / "Network"
+        cell.mkdir()
+        (cell / "p__Network__0.json").write_text("x" * 10)                 # normal
+        (cell / "p__Network__1.json").write_text("x" * (vc.OVERSIZE_BYTES + 1))
+        vc.OVERSIZE_CHUNKS.clear()
+        chunks = vc.build_chunks(tmp_path, chunk_size=4000)
+        assert len(chunks) == 2, "oversize file must not ride with the normal one"
+        assert len(vc.OVERSIZE_CHUNKS) == 1
+        big = next(d.name for _c, d in chunks if d.name in vc.OVERSIZE_CHUNKS)
+        assert (tmp_path / "_batches" / big / "p__Network__1.json").exists()

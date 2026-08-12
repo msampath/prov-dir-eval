@@ -51,11 +51,14 @@ DEFAULT_CHUNK = 4000
 # publishes networks carrying up to 66k address entries EACH), and one chunk
 # timeout then throws away the WHOLE cell. Files above OVERSIZE_BYTES go into
 # their own small chunks so a timeout costs at most OVERSIZE_PER_CHUNK
-# pathological files, never the 1,300 normal ones sharing their cell. Two per
-# chunk: tolerates ~28 min/file inside the default 3600s timeout, and the
-# extra container-startup overhead vs bigger groups is a few minutes total.
+# pathological files, never the 1,300 normal ones sharing their cell.
 OVERSIZE_BYTES = 1_000_000
-OVERSIZE_PER_CHUNK = 2
+# One oversize file per chunk (was 2). Measured: 13 Network chunks of two
+# bcbs_az "network" Organizations -- resources carrying up to 66,235 address
+# entries each -- still blew a 1h timeout, so pairing them just doubled what
+# each timeout threw away. One per chunk plus a separate, longer budget
+# (--oversize-timeout) means a whale costs only itself.
+OVERSIZE_PER_CHUNK = 1
 DEFAULT_PKG_CACHE = "F:/fhir_cache"
 FILE_EXT = "http://hl7.org/fhir/StructureDefinition/operationoutcome-file"
 MSGID_EXT = "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id"
@@ -94,6 +97,45 @@ CREATE TABLE IF NOT EXISTS public.conformance_instance (
     warnings     integer NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, payer_id, cell, instance));
 """
+
+
+# Chunk-dir names holding an oversize instance, populated by build_chunks and
+# read by run_chunk to pick the longer timeout. A module-level set rather than
+# a field on the chunk tuple so the (cell, dir) shape stays what every caller
+# and test already expects.
+OVERSIZE_CHUNKS: set[str] = set()
+
+
+def worker_cache(pkg_cache: Path, worker: int) -> Path:
+    """Per-worker copy of the warmed FHIR package cache.
+
+    A SHARED /root/.fhir mount cannot survive 14 concurrent validators: the
+    cache manager does housekeeping writes (it deletes and re-extracts package
+    directories) with no cross-process locking, so one container's cleanup
+    walks a tree another is reading. Measured: 17 of 46 chunks died together
+    in `FileUtils.forceDelete`/`walkFileTree` after warm-up had already proven
+    the cache complete -- warming fixes the download storm, not the race.
+
+    Each worker therefore validates against its own copy, seeded once from the
+    warmed original. Costs disk and a one-time copy; buys the only thing that
+    actually makes concurrent validators safe.
+    """
+    return pkg_cache.parent / f"{pkg_cache.name}_w{worker}"
+
+
+def seed_worker_caches(pkg_cache: Path, workers: int) -> list[Path]:
+    """Clone the warmed cache once per worker. Returns the per-worker paths.
+
+    Copies only what is missing, so an interrupted seeding resumes rather than
+    starting over, and a re-run after --reuse-outputs pays nothing.
+    """
+    out = []
+    for w in range(workers):
+        dest = worker_cache(pkg_cache, w)
+        if not dest.exists():
+            shutil.copytree(pkg_cache, dest)
+        out.append(dest)
+    return out
 
 
 def restore_from_backup(sample_dir: Path, backup_dir: Path) -> int:
@@ -180,7 +222,8 @@ def build_chunks(sample_dir: Path, chunk_size: int) -> list[tuple[str, Path]]:
         idx = 0
         # Oversize files ride in their own small chunks (see OVERSIZE_BYTES
         # above) so a --chunk-timeout kill loses only them, not their cell.
-        for group, per in ((normal, chunk_size), (oversize, OVERSIZE_PER_CHUNK)):
+        for group, per, big in ((normal, chunk_size, False),
+                                (oversize, OVERSIZE_PER_CHUNK, True)):
             for i in range(0, len(group), per):
                 dest = batch_root / f"{cell}__{idx:03d}"
                 idx += 1
@@ -188,11 +231,13 @@ def build_chunks(sample_dir: Path, chunk_size: int) -> list[tuple[str, Path]]:
                 for f in group[i:i + per]:
                     f.rename(dest / f.name)
                 chunks.append((cell, dest))
+                if big:
+                    OVERSIZE_CHUNKS.add(dest.name)
     return chunks
 
 
 def run_chunk(cell: str, chunk_dir: Path, sample_dir: Path, args,
-              out_dir: Path) -> tuple[str, Path, int, str]:
+              out_dir: Path, worker: int = 0) -> tuple[str, Path, int, str]:
     out_file = out_dir / f"{chunk_dir.name}.json"
     if args.reuse_outputs and out_file.exists() and out_file.stat().st_size > 0:
         # Resume: this chunk already produced output in an earlier attempt.
@@ -211,9 +256,13 @@ def run_chunk(cell: str, chunk_dir: Path, sample_dir: Path, args,
     if args.pkg_cache:
         # The validator (running as root in the container) keeps its FHIR
         # package cache under /root/.fhir. Without this mount every container
-        # re-downloads the IGs (~55s each); with it the whole fleet shares one
-        # warm cache.
-        mounts += ["-v", f"{Path(args.pkg_cache).as_posix()}:/root/.fhir"]
+        # re-downloads the IGs (~55s each). The mount is the WORKER'S OWN copy,
+        # never the shared original -- see worker_cache() for why sharing it
+        # across concurrent containers corrupts them.
+        cache = Path(args.pkg_cache)
+        if worker > 0 or args.per_worker_cache:
+            cache = worker_cache(Path(args.pkg_cache), worker)
+        mounts += ["-v", f"{cache.as_posix()}:/root/.fhir"]
     if args.tx_cache:
         mounts += ["-v", f"{Path(args.tx_cache).as_posix()}:/txcache"]
     cmd = [
@@ -248,13 +297,19 @@ def run_chunk(cell: str, chunk_dir: Path, sample_dir: Path, args,
     cidfile = out_dir / f"{chunk_dir.name}.cid"
     cidfile.unlink(missing_ok=True)  # docker refuses to overwrite an existing cidfile
     cmd[cmd.index("run") + 1:cmd.index("run") + 1] = ["--cidfile", str(cidfile)]
+    # Oversize chunks get their own, longer budget: a single 25MB Organization
+    # with tens of thousands of addresses legitimately takes far longer than a
+    # 4,000-instance chunk of ordinary resources, and holding both to one
+    # timeout means either killing valid work or letting a hang run for hours.
+    budget = (args.oversize_timeout if chunk_dir.name in OVERSIZE_CHUNKS
+              else args.chunk_timeout)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace",
-                           timeout=args.chunk_timeout)
+                           timeout=budget)
         rc, tail = p.returncode, (p.stderr or p.stdout or "")[-400:]
     except subprocess.TimeoutExpired:
-        rc, tail = -1, f"chunk timed out after {args.chunk_timeout}s; container killed"
+        rc, tail = -1, f"chunk timed out after {budget}s; container killed"
         try:
             cid = cidfile.read_text(encoding="utf-8").strip()
             if cid:
@@ -335,6 +390,20 @@ def main() -> int:
     ap.add_argument("--tx-cache", default=None,
                      help="host dir mounted+passed as -txCache so terminology "
                           "server responses persist across containers/runs")
+    ap.add_argument("--per-worker-cache", action="store_true", default=True,
+                     help="give each worker its own copy of the warmed package "
+                          "cache. ON by default: a shared cache is corrupted by "
+                          "concurrent validators (17/46 chunks died in the "
+                          "cache manager's own cleanup). --no-per-worker-cache "
+                          "restores sharing, only safe at --workers 1.")
+    ap.add_argument("--no-per-worker-cache", dest="per_worker_cache",
+                     action="store_false")
+    ap.add_argument("--oversize-timeout", type=int, default=14400, metavar="SEC",
+                     help="timeout for a chunk holding an oversize (>1MB) "
+                          "instance. Separate from --chunk-timeout because one "
+                          "66k-address Organization legitimately takes hours "
+                          "while an ordinary 4,000-instance chunk takes ~10min. "
+                          "Default: %(default)s (4h)")
     ap.add_argument("--chunk-timeout", type=int, default=3600, metavar="SEC",
                      help="kill a chunk's container after SEC seconds (a hung "
                           "validator once stalled a run for 6h). The chunk is "
@@ -441,6 +510,9 @@ def main() -> int:
     done = 0
     lock = threading.Lock()
     failures: list[str] = []
+    # Chunk NAMES (not just log lines) so the run row can record exactly
+    # which instances went unvalidated -- see the notes update at the end.
+    failed_chunks: list[str] = []
     results: list[tuple[str, Path]] = []
     pending = list(chunks)
 
@@ -479,17 +551,42 @@ def main() -> int:
             sentinel.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"), encoding="utf-8")
             print(f"  [1/{len(chunks)}] {dir0.name} (warm-up)", flush=True)
 
-    def worker(item):
+    # Seed per-worker caches AFTER warm-up, so each copy is of a cache already
+    # proven complete -- cloning a cold one would just replicate the download
+    # storm 14 times. Skipped entirely at --workers 1 (nothing to race).
+    n_workers = min(args.workers, max(1, len(pending)))
+    if args.pkg_cache and args.per_worker_cache and n_workers > 1:
+        src = Path(args.pkg_cache)
+        one = sum(f.stat().st_size for f in src.rglob("*") if f.is_file())
+        free = shutil.disk_usage(src.anchor).free
+        need = one * n_workers
+        print(f"seeding {n_workers} per-worker package cache copies "
+              f"({one / 1e9:.1f}GB each, ~{need / 1e9:.0f}GB total, "
+              f"{free / 1e9:.0f}GB free) -- prevents the concurrent-cache "
+              f"corruption that killed 17 chunks last run. Kept after the run "
+              f"so a resume re-copies nothing; delete "
+              f"{src.parent / (src.name + '_w*')} to reclaim.", flush=True)
+        if need > free * 0.5:
+            raise SystemExit(
+                f"FATAL: per-worker caches need ~{need / 1e9:.0f}GB but only "
+                f"{free / 1e9:.0f}GB is free. Lower --workers, or pass "
+                "--no-per-worker-cache (UNSAFE above --workers 1)."
+            )
+        seed_worker_caches(src, n_workers)
+        print("caches seeded.", flush=True)
+
+    def worker(item, widx: int):
         nonlocal done
         cell, chunk_dir = item
         c, out_file, rc, tail = run_chunk(cell, chunk_dir, sample_dir,
-                                          args, out_dir)
+                                          args, out_dir, worker=widx)
         with lock:
             done += 1
             # The validator exits non-zero when it FINDS errors, so a bad exit
             # code alone is not a failure -- only a missing output file is.
             if not out_file.exists():
                 failures.append(f"{chunk_dir.name} rc={rc}: {tail}")
+                failed_chunks.append(chunk_dir.name)
                 print(f"  [{done}/{len(chunks)}] FAILED {chunk_dir.name} rc={rc}",
                       flush=True)
             else:
@@ -501,16 +598,19 @@ def main() -> int:
     threads: list[threading.Thread] = []
     qlock = threading.Lock()
 
-    def pump():
+    def pump(widx: int):
+        # Each pump thread owns one worker index for the whole run, so it also
+        # owns exactly one package-cache copy -- two threads must never share
+        # a cache dir (that is the race this indexing exists to prevent).
         while True:
             with qlock:
                 if not pending:
                     return
                 item = pending.pop(0)
-            worker(item)
+            worker(item, widx)
 
-    for _ in range(min(args.workers, max(1, len(pending)))):
-        t = threading.Thread(target=pump, daemon=True)
+    for _w in range(min(args.workers, max(1, len(pending)))):
+        t = threading.Thread(target=pump, args=(_w,), daemon=True)
         t.start()
         threads.append(t)
     for t in threads:
@@ -537,8 +637,29 @@ def main() -> int:
                     for r in iss:
                         cp.write_row((run_id, *r))
                 n_iss += len(iss)
-        cur.execute("UPDATE public.conformance_run SET finished_at = now() "
-                    "WHERE run_id = %s", (run_id,))
+        # Record which chunks did NOT produce results, and how many instances
+        # they covered. Without this a failed chunk is a silent absence: run 3
+        # lost 30 of 46 chunks and the only evidence was a log line, so any
+        # report reading the DB alone would have treated 67,744 unvalidated
+        # instances as simply "not sampled" rather than "attempted and failed".
+        unvalidated = 0
+        failed_detail = []
+        for name in failed_chunks:
+            d = sample_dir / "_batches" / name
+            n = len(list(d.glob("*.json"))) if d.is_dir() else None
+            if n:
+                unvalidated += n
+            failed_detail.append({"chunk": name, "instances": n})
+        cur.execute(
+            "UPDATE public.conformance_run SET finished_at = now(), "
+            "notes = coalesce(notes, '{}'::jsonb) || %s::jsonb "
+            "WHERE run_id = %s",
+            (json.dumps({"chunks_total": len(chunks),
+                         "chunks_ok": len(results),
+                         "chunks_failed": len(failed_detail),
+                         "instances_unvalidated": unvalidated,
+                         "failed_chunks": failed_detail}), run_id),
+        )
     print(f"recorded {n_inst:,} instance result(s), {n_iss:,} issue(s) "
           f"under run_id {run_id}", flush=True)
     if failures:
