@@ -56,3 +56,32 @@ class TestReplayedCursorIsNotDone:
                     "fetch error", "bucket", "timeout", "rejected", "error",
                     "failed")
         assert not any(k in note.lower() for k in keywords)
+
+
+class TestGuardOnlyArmsOnAResumedCursor:
+    """The two cases look identical inside a batch, so the guard keys off
+    whether a cursor was actually resumed.
+
+    A fresh walk over an existing file MUST tolerate unlimited duplicate
+    batches: premera's cursors expire (HTTP 410), forcing a restart from page
+    1, and Location then re-pages ~3,964 pages / ~40 all-duplicate batches
+    before reaching anything new. Arming the guard there killed a healthy
+    re-walk a few hundred pages in.
+    """
+
+    @staticmethod
+    def _armed(progress: dict) -> bool:
+        # Mirrors the predicate in paginate_to_file._run's flush.
+        return progress.get("pages_base") is not None
+
+    def test_resumed_cursor_arms_the_guard(self):
+        # extract_resource sets pages_base ONLY when the resume URL was accepted.
+        assert self._armed({"pages_base": 1371, "added_base": 68550})
+
+    def test_fresh_walk_does_not_arm_the_guard(self):
+        assert not self._armed({})
+
+    def test_failed_resume_does_not_arm_the_guard(self):
+        """A 410'd cursor falls back to a fresh walk and never sets pages_base,
+        so the duplicate prefix it must re-page is not treated as a replay."""
+        assert not self._armed({"active": True, "pages": 150})

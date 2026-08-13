@@ -178,10 +178,19 @@ async def _run(payer: str, rtype: str, out_dir: str, max_pages: int | None,
         dupes = len(batch) - len(fresh)
         replay["dupes"] += dupes
         # A batch that is ENTIRELY records we already hold means the cursor is
-        # re-serving, not advancing. One such batch is normal right after a
-        # resume (checkpoints intentionally rewind a little); a run of them
-        # means the token reset the chain.
-        if batch and not fresh:
+        # re-serving, not advancing -- but ONLY if a cursor was resumed at all.
+        # extract_resource sets progress["pages_base"] exactly when the resume
+        # URL was accepted, so that flag is what distinguishes the two cases
+        # that look identical from inside a batch:
+        #   * resumed cursor + all duplicates  -> replay; abort fast.
+        #   * FRESH walk + all duplicates      -> expected. A walk that restarts
+        #     from page 1 over an existing file (premera's cursors expire with
+        #     410, forcing exactly this) must re-page through everything it
+        #     already holds before reaching new records -- for Location that is
+        #     ~3,964 pages / ~40 all-duplicate batches. Arming the guard here
+        #     would kill a perfectly healthy re-walk a few hundred pages in.
+        resumed = progress.get("pages_base") is not None
+        if resumed and batch and not fresh:
             replay["pages"] += 1
             if replay["pages"] >= REPLAY_LIMIT:
                 raise ReplayedCursor(
