@@ -118,31 +118,70 @@ class Sink:
 
 
 class Progress:
-    """Per-bucket checkpoint so an interrupted run does not re-walk finished work."""
+    """Checkpoint of finished buckets AND the position of unfinished ones.
+
+    Recording only completed buckets is not enough. The unpartitioned walks are
+    the long ones (Location is 99,376 pages, ~75h) and they would checkpoint
+    nothing until the end, so any interruption restarts them at page 1. No data
+    is lost, since the sink deduplicates, but the time is.
+
+    Mid-walk resume works here because cursorMark is stateless: a next link
+    stored now is still valid later. Payers that issue session cursors cannot
+    do this, which is why the file sweep only checkpoints per unit.
+    """
 
     def __init__(self, path: Path):
         self.path = path
         self.lock = threading.Lock()
         self.done: dict[str, dict] = {}
+        self.inflight: dict[str, dict] = {}
         if path.exists():
             try:
-                self.done = json.loads(path.read_text(encoding="utf-8"))
+                raw = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
-                self.done = {}
+                raw = {}
+            # Older runs stored a bare {key: stats} map with no envelope.
+            if "done" in raw and "inflight" in raw:
+                self.done = raw.get("done") or {}
+                self.inflight = raw.get("inflight") or {}
+            else:
+                self.done = raw
+        if self.inflight:
+            print(f"  resuming {len(self.inflight)} interrupted walk(s) mid-cursor",
+                  flush=True)
 
     def is_done(self, key: str) -> bool:
         return key in self.done
 
+    def resume_url(self, key: str) -> str | None:
+        rec = self.inflight.get(key)
+        return rec.get("url") if rec else None
+
+    def _flush_unlocked(self):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"done": self.done, "inflight": self.inflight}),
+                       encoding="utf-8")
+        tmp.replace(self.path)
+
+    def mark(self, key: str, url: str, pages: int):
+        """Record where an unfinished walk has reached."""
+        with self.lock:
+            self.inflight[key] = {"url": url, "pages": pages}
+            self._flush_unlocked()
+
     def finish(self, key: str, total, fetched: int, pages: int):
         with self.lock:
             self.done[key] = {"total": total, "fetched": fetched, "pages": pages}
-            tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self.done), encoding="utf-8")
-            tmp.replace(self.path)
+            self.inflight.pop(key, None)
+            self._flush_unlocked()
+
+
+CHECKPOINT_EVERY = 20          # pages; ~1 min of walking at the measured 2.7s
 
 
 def walk(c: httpx.Client, url: str, params: dict | None, sink: Sink,
-         label: str, delay: float, max_pages: int | None = None):
+         label: str, delay: float, max_pages: int | None = None,
+         on_page=None, pages0: int = 0):
     """Follow cursorMark pagination to exhaustion.
 
     Returns (total, fetched, pages, specialty_codes_seen).
@@ -151,7 +190,7 @@ def walk(c: httpx.Client, url: str, params: dict | None, sink: Sink,
     an interrupted walk can restart from the beginning of its own bucket
     without the server rejecting a stale cursor.
     """
-    total, fetched, pages = None, 0, 0
+    total, fetched, pages = None, 0, pages0
     found: set[str] = set()
     while True:
         for attempt in range(4):
@@ -185,6 +224,8 @@ def walk(c: httpx.Client, url: str, params: dict | None, sink: Sink,
             print(f"    {label}: hit --max-pages {max_pages}", flush=True)
             return total, fetched, pages, found
         url = nxt[0]
+        if on_page and pages % CHECKPOINT_EVERY == 0:
+            on_page(url, pages)
         if delay:
             time.sleep(delay)
 
@@ -242,8 +283,17 @@ def main() -> int:
                 # gives 0, practitioner=123 gives 10.
                 params[param] = code
             t0 = time.time()
-            total, fetched, pages, found = walk(c, f"{BASE}/{res}", params,
-                                                sinks[res], key, a.delay, a.max_pages)
+            resume = prog.resume_url(key)
+            if resume:
+                pages0 = (prog.inflight.get(key) or {}).get("pages", 0)
+                print(f"  {key}: resuming mid-cursor at page {pages0:,}", flush=True)
+                total, fetched, pages, found = walk(
+                    c, resume, None, sinks[res], key, a.delay, a.max_pages,
+                    on_page=lambda u, n: prog.mark(key, u, n), pages0=pages0)
+            else:
+                total, fetched, pages, found = walk(
+                    c, f"{BASE}/{res}", params, sinks[res], key, a.delay,
+                    a.max_pages, on_page=lambda u, n: prog.mark(key, u, n))
         prog.finish(key, total, fetched, pages)
         if res == "PractitionerRole" and param == "specialty" and found:
             with qlock:
