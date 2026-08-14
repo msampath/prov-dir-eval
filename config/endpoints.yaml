@@ -813,22 +813,22 @@ endpoints:
     payer_name: HCSC (BCBS IL/TX/NM/OK/MT)
     parent_org: Health Care Service Corporation
     brands: [BCBS Illinois, BCBS Texas, BCBS New Mexico, BCBS Oklahoma, BCBS Montana]
-    # Base confirmed via the ProviderFinder RAML (v1.1.5): baseUri
-    # api.hcsc.net/providerfinder/ + v1 + /sapphire/fhir.
-    # BLOCKED at the edge (probed 2026-07-08 WITH valid issued credentials):
-    # api.hcsc.net is fronted by Akamai Bot Manager; every GET returns an
-    # identical Akamai 500 deny (errors.edgesuite.net) regardless of creds /
-    # header form / browser UA, so the ClientId never reaches the MuleSoft
-    # gateway. Not an auth/config problem — see docs/evidence/hcsc_access.md.
-    # Creds are in .env but a pull cannot succeed until HCSC unblocks API traffic.
-    base_url: https://api.hcsc.net/providerfinder/v1/sapphire/fhir
+    # RESOLVED 2026-08-14. The "Akamai edge block" was the /v1/ path.
+    # The RAML (v1.1.5) documents baseUri as providerfinder/ + v1 + /sapphire/fhir,
+    # and that path returns HTTP 500 on every request with or without credentials.
+    # Drop /v1/ and the same request returns 200. The 500 (rather than a 404) is
+    # what made this look like an edge deny for a month; it is a wrong URL.
+    base_url: https://api.hcsc.net/providerfinder/sapphire/fhir
     status: known
     mvp: false
     auth:
-      strategy: client_id_secret_headers
-      secret_keys: [HCSC_CLIENT_ID, HCSC_CLIENT_SECRET]
-      header_name: ClientId              # MuleSoft; declared explicitly (not via default)
-      secret_header_name: ClientSecret
+      # A single client-id header is sufficient; no secret is sent. Probed
+      # 2026-08-14: client_id / ClientId / ClientId+ClientSecret all return 200,
+      # no header returns 401. HCSC's own sample uses lowercase client_id, so
+      # that is what we send. HCSC_CLIENT_SECRET is retained in .env but unused.
+      strategy: client_id_header
+      secret_keys: [HCSC_CLIENT_ID]
+      header_name: client_id
     resource_subset:
       - Organization
       - Practitioner
@@ -837,16 +837,41 @@ endpoints:
       - OrganizationAffiliation
       # omits InsurancePlan, HealthcareService, Endpoint
     quirks:
-      # RAML-declared search params (VERIFY on first authenticated pull —
-      # declared != working): PractitionerRole{practitioner,organization,network,
-      # location,specialty}; Practitioner{family,given,name}; Organization{name};
-      # Location{name,address-city,address-state,address-postalcode};
-      # OrganizationAffiliation{specialty,network,location,primary-organization}.
-      # Pre-wired: roles via the specialty ValueSet (specialty is searchable);
-      # Practitioner via family prefix. Add _include to roles if honored.
-      adaptive:
-        PractitionerRole: {mode: values, param: specialty, values_ref: specialties, bucket_max: 100000}
-        Practitioner: {param: family, mode: prefix, bucket_max: 100000}
+      # Search params VERIFIED against the live API 2026-08-14. Working:
+      # Location{address-state,address-city,address-postalcode,name};
+      # Practitioner{family,given,name}; Organization{name};
+      # PractitionerRole{specialty,practitioner,organization,location,network};
+      # OrganizationAffiliation{specialty,location,network}.
+      # 400s: _summary=count, _lastUpdated, _id, active, the :missing/:exact/
+      # :contains modifiers, and address-* on Practitioner and Organization.
+      # Two traps the RAML does not mention:
+      #  1. String search is EXACT match. Only a trailing '*' gives a prefix
+      #     (family=SMIT -> 13, family=SMITH -> 8,879, family=SMI* -> 9,263).
+      #     A bare-letter prefix sweep returns 869 of 1,474,158 Practitioners.
+      #  2. specialty uses HCSC's own system
+      #     https://my.providerfinderonline.com/fhir/specialties with numeric
+      #     codes (100000054 = Internal Medicine), NOT NUCC. The shared
+      #     `specialties` value list is NUCC and matches ZERO records here, so
+      #     wiring it would report success having extracted nothing.
+      # Reconciliation (bucket sums vs Bundle.total): Location address-state is
+      # complete to 58 records in 4,968,810. name-based keys are not usable --
+      # Organization name=X* over-counts 3.5x and Location name=X* MISSES 29%,
+      # because `name` matches any token in a multi-word name.
+      # PractitionerRole partitioning by specialty is sound (0 of 6,000 sampled
+      # records lack a specialty) but 17% carry more than one, so completeness
+      # must be proven by DISTINCT ID count against Bundle.total, never by
+      # summing bucket totals.
+      # Both partitions intentionally left UNWIRED, because every mode the
+      # shared extractor supports is wrong for this server:
+      #   PractitionerRole - `values` mode needs the specialty code list, and
+      #     the only list we have is NUCC, which matches nothing here.
+      #   Practitioner - `prefix` mode emits bare letters, which this server
+      #     treats as exact matches (869 of 1,474,158). It needs a trailing
+      #     '*', which no existing mode emits, and `prefix` also subdivides via
+      #     _summary=count, which returns 400 here.
+      # A partition wired to a mode that "runs" but returns almost nothing is
+      # worse than none, so HCSC is pulled by a dedicated puller instead.
+      adaptive: {}
 
   - key: florida_blue
     payer_name: Florida Blue
