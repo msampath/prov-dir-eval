@@ -166,6 +166,9 @@ def build(data: dict) -> str:
 
     flag = (f'<span class="chip flag">conformance sample {note}</span>'
             if partial else f'<span class="chip">conformance {note}</span>')
+    tho = runs.get("conformance_tho")
+    tho_chip = (f'<span class="chip">terminology {tho}</span>' if tho
+                else '<span class="chip flag">no THO package: v2-0360 unresolved</span>')
 
     return f"""<title>Provider directory conformance map</title>
 <style>{CSS}</style>
@@ -178,6 +181,7 @@ def build(data: dict) -> str:
   <div class="prov">
     <span class="chip">generated {gen} UTC</span>
     {flag}
+    {tho_chip}
     <span class="chip">binding run {runs.get('binding')}</span>
     <span class="chip">coverage run {runs.get('coverage')}</span>
   </div>
@@ -240,7 +244,7 @@ def build(data: dict) -> str:
   <div class="tablewrap"><table id="tbl">
     <thead><tr>
       <th data-k="name">Payer</th><th data-k="states">States</th><th data-k="locations">Locations</th>
-      <th data-k="practitioners">Practitioners</th><th data-k="roles">Roles</th>
+      <th data-k="practitioners">Practitioners ~</th><th data-k="roles">Roles ~</th>
       <th data-k="conformance">Structural</th><th data-k="binding">Binding</th>
       <th data-k="uscdi">USCDI v3</th><th data-k="mpf">MPF</th><th data-k="plannet_ext">Plan-Net ext</th>
     </tr></thead><tbody></tbody>
@@ -253,6 +257,12 @@ def build(data: dict) -> str:
   not a sample, and counts rows whose codes are members of the bound value set. Coverage rates
   average only measurable required elements; elements our mapping cannot measure are reported
   separately and never counted as zero.</p>
+  <p><b>Exact counts and estimates.</b> Location counts and everything derived from geography are
+  exact, because that table is scanned in full to build the map. Counts marked <span class="mono">~</span>
+  are Postgres planner estimates. An exact count of every resource is not affordable here:
+  PractitionerRole alone is roughly 520M rows across the corpus, 499.5M of it Aetna. The estimates
+  are close (Aetna PractitionerRole estimates 499,538,560 against a known 499,540,580) but they are
+  estimates, and a few payers loaded most recently will read further off.</p>
   <p><b>Caveats that change interpretation.</b> USCDI v3 has no official element-level mapping to
   Plan-Net, so that column is our inference and is labelled as such. MPF elements come from the CMS
   Technical Implementation Guide dated 18 Feb 2026, read via a DocumentCloud mirror because cms.gov
@@ -267,9 +277,9 @@ const DATA = {payload};
 const TILE = {tiles};
 const P = DATA.payers;
 const $ = s => document.querySelector(s);
-const fmt = n => n == null ? '—' : n.toLocaleString('en-US');
+const fmt = n => n == null ? 'n/a' : n.toLocaleString('en-US');
 const pct = v => v == null ? null : v * 100;
-const pf = v => v == null ? '—' : (v * 100).toFixed(1) + '%';
+const pf = v => v == null ? 'n/a' : (v * 100).toFixed(1) + '%';
 
 function confRate(p) {{
   const c = p.conformance; if (!c || !c.validated) return null;
@@ -377,7 +387,7 @@ function drawMap() {{
 function selectState(st) {{ selState = (selState === st ? '' : st); drawMap(); drawDetail(); }}
 
 function rateBar(v) {{
-  if (v == null) return '<span class="nd">—</span>';
+  if (v == null) return '<span class="nd">n/a</span>';
   const col = v >= .95 ? 'var(--good)' : v >= .6 ? 'var(--warn)' : 'var(--bad)';
   return `<span class="bar"><i style="width:${{(v * 100).toFixed(1)}}%;background:${{col}}"></i></span>`
        + `<span class="num" style="margin-left:8px">${{(v * 100).toFixed(1)}}%</span>`;
@@ -421,12 +431,12 @@ function showPayer(id) {{
     ['Medicare Advantage', p.is_ma ? 'yes' : 'no'],
     ['States with locations', sts.length],
     ['Locations', fmt(res.Location)],
-    ['Practitioners', fmt(res.Practitioner)],
-    ['PractitionerRoles', fmt(res.PractitionerRole)],
-    ['Organizations', fmt(res.Organization)],
-    ['HealthcareServices', fmt(res.HealthcareService)],
-    ['InsurancePlans', fmt(res.InsurancePlan)],
-    ['Locations with lat/long', geo.locations ? `${{fmt(geo.with_latlon)}} (${{(100 * geo.with_latlon / geo.locations).toFixed(0)}}%)` : '—'],
+    ['Practitioners ~', fmt(res.Practitioner)],
+    ['PractitionerRoles ~', fmt(res.PractitionerRole)],
+    ['Organizations ~', fmt(res.Organization)],
+    ['HealthcareServices ~', fmt(res.HealthcareService)],
+    ['InsurancePlans ~', fmt(res.InsurancePlan)],
+    ['Locations with lat/long', geo.locations ? `${{fmt(geo.with_latlon)}} (${{(100 * geo.with_latlon / geo.locations).toFixed(0)}}%)` : 'n/a'],
   ].map(([k, v]) => `<div class="row"><span class="k">${{k}}</span><b class="num">${{v}}</b></div>`).join('');
   const rates = [
     ['Structural conformance', confRate(p)], ['Binding conformance', bindRate(p)],
@@ -464,7 +474,7 @@ function drawTable() {{
     if (y == null) return -1;
     return (typeof x === 'string' ? x.localeCompare(y) : x - y) * sortDir;
   }});
-  const rate = v => v == null ? '<span class="nd">—</span>' : `<span class="num">${{(v * 100).toFixed(1)}}%</span>`;
+  const rate = v => v == null ? '<span class="nd">n/a</span>' : `<span class="num">${{(v * 100).toFixed(1)}}%</span>`;
   $('#tbl tbody').innerHTML = rows.map(r =>
     `<tr data-p="${{r.id}}"><td>${{r.name}}${{r.is_ma ? '<span class="tag">MA</span>' : ''}}</td>`
     + `<td class="num">${{r.states}}</td><td class="num">${{fmt(r.locations)}}</td>`
@@ -487,7 +497,7 @@ function drawStats() {{
   const cards = [
     ['Payers', list.length], ['States covered', sts.size],
     ['Locations', fmt(loc)], ['PractitionerRoles', fmt(pr)],
-    ['Mean structural conformance', mean == null ? '—' : (mean * 100).toFixed(1) + '%'],
+    ['Mean structural conformance', mean == null ? 'n/a' : (mean * 100).toFixed(1) + '%'],
   ];
   $('#stats').innerHTML = cards.map(([k, v]) =>
     `<div class="stat"><div class="k">${{k}}</div><div class="v num">${{v}}</div></div>`).join('');

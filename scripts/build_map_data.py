@@ -49,15 +49,29 @@ def payer_schemas(conn) -> list[str]:
 
 
 def resource_counts(conn, payer: str) -> dict[str, int]:
-    """Live row counts. n_live_tup, not reltuples: reltuples goes stale by ~7x
-    on a freshly bulk-loaded table and would misreport the biggest payers."""
+    """Estimated row counts, from whichever estimator is actually populated.
+
+    Neither estimator is reliable alone here. n_live_tup reads 0 for every
+    payer except the one written most recently, and reltuples goes stale
+    during a bulk load. Taking the larger of the two is right because both
+    fail low, never high: a reset stat collector reports 0 and a mid-load
+    reltuples reports a fraction of the final count.
+
+    These are estimates. Location is overwritten with an exact count in main(),
+    since state_counts already scans that table, and the two counts are
+    reported separately so the page can say which is which. An exact count of
+    every resource is not affordable: practitioner_role alone is ~520M rows
+    corpus-wide, ~499.5M of it Aetna.
+    """
     out = {}
     for res, tbl in TABLE.items():
-        n = conn.execute(text(
-            "select coalesce(n_live_tup,0) from pg_stat_all_tables "
-            "where schemaname=:s and relname=:t"), {"s": payer, "t": tbl}).scalar()
-        if n is not None:
-            out[res] = int(n)
+        row = conn.execute(text(
+            "select coalesce(st.n_live_tup,0), coalesce(cl.reltuples,0)::bigint "
+            "from pg_class cl join pg_namespace n on n.oid=cl.relnamespace "
+            "left join pg_stat_all_tables st on st.relid=cl.oid "
+            "where n.nspname=:s and cl.relname=:t"), {"s": payer, "t": tbl}).fetchone()
+        if row:
+            out[res] = max(int(row[0]), int(row[1]), 0)
     return out
 
 
@@ -180,7 +194,17 @@ def main() -> int:
             "select max(run_id) from binding_check_run")).scalar()
         cov_run = a.coverage_run or c.execute(text(
             "select max(run_id) from element_coverage_run")).scalar()
-        print(f"conformance run {conf_run} [{conf_note}], "
+        # Whether THO was loaded changes how v2-0360 qualification codes resolve,
+        # so the run's terminology basis travels with its numbers.
+        notes = c.execute(text("select notes from conformance_run where run_id=:r"),
+                          {"r": conf_run}).scalar()
+        if isinstance(notes, str):
+            try:
+                notes = json.loads(notes)
+            except ValueError:
+                notes = {}
+        conf_tho = (notes or {}).get("tho")
+        print(f"conformance run {conf_run} [{conf_note}], tho={conf_tho or 'none'}, "
               f"binding run {bind_run}, coverage run {cov_run}", flush=True)
 
         conf = conformance(c, conf_run) if conf_run else {}
@@ -190,20 +214,28 @@ def main() -> int:
             "select distinct payer_id from element_coverage "
             "where run_id=:r and assessment='mpf'"), {"r": cov_run})} if cov_run else set()
 
-        try:
-            labels = {e.key: (e.display_name or e.key) for e in load_manifest().endpoints}
-        except Exception:
-            labels = {}
+        # brands[0] is the payer's own name for itself; the schema key is a slug.
+        # No silent except here: a lookup that quietly falls back leaves every
+        # row labelled with its slug and looks like a data problem, not a bug.
+        labels = {e.key: (e.brands[0] if e.brands else e.key)
+                  for e in load_manifest().endpoints}
+        unlabelled = [p for p in payer_schemas(c) if p not in labels]
+        if unlabelled:
+            print(f"  note: no manifest brand for {len(unlabelled)} schema(s): "
+                  f"{', '.join(sorted(unlabelled))}", flush=True)
 
         payers = []
         for p in payer_schemas(c):
             print(f"  {p}", flush=True)
             geo_n, loc_n = geocoded(c, p)
+            res = resource_counts(c, p)
+            res["Location"] = loc_n          # exact; geocoded() already scanned it
             payers.append({
                 "id": p,
                 "name": labels.get(p, p),
                 "is_ma": p in ma,
-                "resources": resource_counts(c, p),
+                "resources": res,
+                "counts_exact": ["Location"],
                 "states": state_counts(c, p),
                 "geocoded": {"with_latlon": geo_n, "locations": loc_n},
                 "conformance": conf.get(p),
@@ -214,6 +246,7 @@ def main() -> int:
     doc = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "runs": {"conformance": conf_run, "conformance_note": conf_note,
+                 "conformance_tho": conf_tho,
                  "binding": bind_run, "coverage": cov_run},
         "payers": payers,
     }

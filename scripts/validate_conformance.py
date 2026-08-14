@@ -21,11 +21,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -197,6 +199,58 @@ def restore_cells(sample_dir: Path) -> int:
             n += 1
     shutil.rmtree(batch_root)
     return n
+
+
+_SAMPLE_LOCK = None  # held open for the process lifetime; OS frees it on exit
+
+
+def lock_sample_dir(sample_dir: Path) -> None:
+    """Take an exclusive OS lock on the sample dir, or refuse to start.
+
+    Two runs cannot share a sample dir. build_chunks() moves every file into
+    `_batches/` and restore_cells() moves them all back, so a second run pulls
+    files out from under the first one's containers while they are reading.
+
+    This is not hypothetical. The whale retry was created with a TimeTrigger
+    and started nine minutes before the run it was meant to follow had
+    finished. It re-chunked the sample under the running validator and then
+    crashed that run's cleanup with a PermissionError, leaving 10,986 files
+    sitting in both a cell dir and a chunk dir.
+
+    An OS byte-range lock, not a PID file: the kernel releases it when the
+    process dies, so a crashed run leaves nothing stale to reap. Checking
+    liveness by hand would be worse than useless here, since os.kill(pid, 0)
+    on Windows terminates the target instead of probing it.
+    """
+    global _SAMPLE_LOCK
+    # r+b, not a+b: append mode ignores seek() on writes, so the holder line
+    # would land at offset 0 and overlap the locked byte.
+    lock_path = sample_dir / ".run.lock"
+    lock_path.touch(exist_ok=True)
+    f = open(lock_path, "r+b")
+    f.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(1)
+        who = f.read(120).decode("utf-8", "replace").strip()
+        f.close()
+        raise SystemExit(
+            f"FATAL: another validate_conformance run already holds {sample_dir}"
+            + (f"\n  holder: {who}" if who else "")
+            + "\nTwo runs cannot share a sample dir: each re-chunks the whole "
+              "sample and would move files out from under the other's "
+              "containers. Wait for it to finish, or stop it first.")
+    f.seek(1)
+    f.write(f"pid {os.getpid()} started "
+            f"{datetime.now().isoformat(timespec='seconds')}".ljust(120).encode())
+    f.flush()
+    _SAMPLE_LOCK = f          # closing (or exiting) releases the lock
 
 
 def build_chunks(sample_dir: Path, chunk_size: int) -> list[tuple[str, Path]]:
@@ -426,6 +480,7 @@ def main() -> int:
         raise SystemExit(f"validator jar not found at {JAR_HOST}")
     if not sample_dir.is_dir():
         raise SystemExit(f"sample dir not found: {sample_dir}")
+    lock_sample_dir(sample_dir)
 
     out_dir = sample_dir / "_out"
     # Reuse is only sound for outputs produced by the SAME validator
