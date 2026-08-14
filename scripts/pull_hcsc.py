@@ -201,6 +201,16 @@ def main() -> int:
                     help="extra seconds between pages within one walk")
     ap.add_argument("--max-pages", type=int, default=None,
                     help="per-bucket page cap, for smoke tests")
+    ap.add_argument("--pr-key", choices=["specialty", "practitioner"], default="specialty",
+                    help="how to partition PractitionerRole. `specialty` is fast "
+                         "(~41h) but blind to a code that never co-occurs with a "
+                         "known one. `practitioner` cannot miss a role, since every "
+                         "role carries a practitioner reference and the Practitioner "
+                         "walk is complete, but costs one request per practitioner.")
+    ap.add_argument("--only-missing-practitioners", action="store_true",
+                    help="with --pr-key practitioner, queue only practitioners that "
+                         "have no role in the sink yet. Narrows a verification sweep "
+                         "to the plausible gap instead of re-reading 1.47M.")
     a = ap.parse_args()
 
     out = Path(a.out_dir)
@@ -217,29 +227,32 @@ def main() -> int:
     # so a code is walked at most once no matter how many records mention it.
     queued: set[str] = set()
     discovered: set[str] = set()          # live codes absent from the seed list
-    q: "queue.Queue[tuple[str, str | None]]" = queue.Queue()
+    q: "queue.Queue[tuple[str, str | None, str]]" = queue.Queue()
     qlock = threading.Lock()
 
-    def unit(res: str, code: str | None):
-        key = f"{res}|{code or '*'}"
+    def unit(res: str, code: str | None, param: str = "specialty"):
+        key = f"{res}|{code or '*'}" if param == "specialty" else f"{res}|prac:{code}"
         if prog.is_done(key):
             return
         with httpx.Client(headers=H, limits=limits, follow_redirects=True) as c:
             params = {"_count": PAGE}
             if code:
-                params["specialty"] = code
+                # Reference params take a BARE id here. The standard Type/id form
+                # returns 0 rather than an error: practitioner=Practitioner/123
+                # gives 0, practitioner=123 gives 10.
+                params[param] = code
             t0 = time.time()
             total, fetched, pages, found = walk(c, f"{BASE}/{res}", params,
                                                 sinks[res], key, a.delay, a.max_pages)
         prog.finish(key, total, fetched, pages)
-        if res == "PractitionerRole" and found:
+        if res == "PractitionerRole" and param == "specialty" and found:
             with qlock:
                 fresh = found - queued
                 if fresh:
                     queued.update(fresh)
                     discovered.update(fresh)
                     for f in sorted(fresh):
-                        q.put((res, f))
+                        q.put((res, f, "specialty"))
             if fresh:
                 print(f"    + {len(fresh)} specialty code(s) not in the seed list: "
                       f"{', '.join(sorted(fresh)[:6])}"
@@ -250,25 +263,57 @@ def main() -> int:
                   f"[{sinks[res].written:,} distinct so far]", flush=True)
 
     for res in resources:
-        if res == "PractitionerRole":
+        if res != "PractitionerRole":
+            q.put((res, None, "specialty"))
+            continue
+        if a.pr_key == "practitioner":
+            pf = out / "hcsc_Practitioner.ndjson"
+            if not pf.exists():
+                raise SystemExit(f"--pr-key practitioner needs {pf}; pull Practitioner first")
+            pids = []
+            with pf.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        pids.append(json.loads(line)["id"])
+                    except Exception:
+                        continue
+            pids = sorted(set(pids))
+            if a.only_missing_practitioners:
+                covered = set()
+                rf = out / "hcsc_PractitionerRole.ndjson"
+                if rf.exists():
+                    with rf.open("r", encoding="utf-8") as fh:
+                        for line in fh:
+                            try:
+                                ref = (json.loads(line).get("practitioner") or {}).get("reference")
+                            except Exception:
+                                continue
+                            if ref:
+                                covered.add(ref.split("/")[-1])
+                before = len(pids)
+                pids = [p for p in pids if p not in covered]
+                print(f"  {before:,} practitioners, {before-len(pids):,} already have a "
+                      f"role in the sink, {len(pids):,} left to sweep", flush=True)
+            print(f"PractitionerRole: {len(pids):,} practitioner buckets", flush=True)
+            for pid in pids:
+                q.put((res, pid, "practitioner"))
+        else:
             codes = load_specialties(Path(a.specialties))
             queued.update(codes)
             print(f"PractitionerRole: {len(codes):,} seed specialty buckets", flush=True)
             for c in codes:
-                q.put((res, c))
-        else:
-            q.put((res, None))
+                q.put((res, c, "specialty"))
 
     print(f"{q.qsize():,} seed unit(s), {a.workers} worker(s) -> {out}", flush=True)
 
     def worker():
         while True:
             try:
-                res, code = q.get(timeout=2)
+                res, code, param = q.get(timeout=2)
             except queue.Empty:
                 return                     # queue drained and nothing refilling it
             try:
-                unit(res, code)
+                unit(res, code, param)
             except Exception as e:
                 print(f"  {res}|{code}: {type(e).__name__}: {e}", flush=True)
             finally:
