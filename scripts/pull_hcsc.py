@@ -89,9 +89,15 @@ class Sink:
     would risk dropping a record entirely, which it would not.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, ids_dir: Path | None = None):
         self.path = path
-        self.ids_path = path.with_suffix(".ids")
+        # The sidecar is read in full on every start and the NDJSON is not, so
+        # it earns a faster disk. The data lives on a USB HDD because it is the
+        # only volume with room for ~200GB; that device reads at ~44MB/s, which
+        # is why the sidecar exists at all.
+        base = ids_dir if ids_dir else path.parent
+        base.mkdir(parents=True, exist_ok=True)
+        self.ids_path = base / (path.stem + ".ids")
         self.lock = threading.Lock()
         self.seen: set[str] = set()
         self.written = 0
@@ -106,16 +112,26 @@ class Sink:
             print(f"  resume: {path.name} {len(self.seen):,} ids from sidecar "
                   f"({time.time()-t0:.0f}s)", flush=True)
         elif path.exists():
+            # Build to a temp file and rename only on success. A sidecar
+            # truncated by a kill is indistinguishable from a complete one, and
+            # the next run would trust it, believe it holds fewer ids than the
+            # NDJSON does, and re-fetch every record past the truncation point.
             t0 = time.time()
-            with path.open("r", encoding="utf-8") as fh, \
-                 self.ids_path.open("w", encoding="utf-8") as out:
-                for line in fh:
-                    m = _ID_RE.search(line)
-                    if m and m.group(1) not in self.seen:
-                        self.seen.add(m.group(1))
-                        out.write(m.group(1) + "\n")
+            tmp = self.ids_path.with_suffix(".ids.building")
+            try:
+                with path.open("r", encoding="utf-8") as fh, \
+                     tmp.open("w", encoding="utf-8") as out:
+                    for line in fh:
+                        m = _ID_RE.search(line)
+                        if m and m.group(1) not in self.seen:
+                            self.seen.add(m.group(1))
+                            out.write(m.group(1) + "\n")
+                tmp.replace(self.ids_path)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             print(f"  resume: {path.name} {len(self.seen):,} ids rebuilt and "
-                  f"cached to {self.ids_path.name} ({time.time()-t0:.0f}s)", flush=True)
+                  f"cached to {self.ids_path} ({time.time()-t0:.0f}s)", flush=True)
         self.written = len(self.seen)
         self.fh = path.open("a", encoding="utf-8")
         self.ids_fh = self.ids_path.open("a", encoding="utf-8")
@@ -326,6 +342,11 @@ def main() -> int:
                          "known one. `practitioner` cannot miss a role, since every "
                          "role carries a practitioner reference and the Practitioner "
                          "walk is complete, but costs one request per practitioner.")
+    ap.add_argument("--ids-dir", default=r"M:\provdir_hcsc_ids",
+                    help="where the .ids dedup sidecars live. Defaults to the "
+                         "SSD rather than beside the data: the sidecar is read "
+                         "in full on every start, the NDJSON is not, and the "
+                         "data volume is a USB HDD reading at ~44MB/s.")
     ap.add_argument("--only-missing-practitioners", action="store_true",
                     help="with --pr-key practitioner, queue only practitioners that "
                          "have no role in the sink yet. Narrows a verification sweep "
@@ -338,7 +359,8 @@ def main() -> int:
     H = {"client_id": client_id(), "Accept": "application/fhir+json"}
     resources = [r.strip() for r in a.resources.split(",") if r.strip()]
 
-    sinks = {r: Sink(out / f"hcsc_{r}.ndjson") for r in resources}
+    ids_dir = Path(a.ids_dir) if a.ids_dir else None
+    sinks = {r: Sink(out / f"hcsc_{r}.ndjson", ids_dir) for r in resources}
     prog = Progress(out / "_progress.json")
     limits = httpx.Limits(max_connections=a.workers + 2,
                           max_keepalive_connections=a.workers + 2)
