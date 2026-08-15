@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -176,6 +178,46 @@ class Progress:
             self._flush_unlocked()
 
 
+_DIR_LOCK = None               # held for the process lifetime; OS frees it on exit
+
+
+def lock_out_dir(out: Path) -> None:
+    """Refuse to start if another puller already holds this output directory.
+
+    Two pullers would append to the same NDJSON concurrently and interleave
+    partial lines, and each would resume from a checkpoint the other is
+    overwriting. An OS byte-range lock rather than a PID file, because the
+    kernel releases it when the process dies, so a crashed or killed run leaves
+    nothing stale to reap. The same collision took out a conformance run
+    earlier today when a scheduled task fired alongside one already going.
+    """
+    global _DIR_LOCK
+    lock_path = out / ".pull.lock"
+    lock_path.touch(exist_ok=True)
+    f = open(lock_path, "r+b")          # r+b: append mode ignores seek on write
+    f.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.seek(1)
+        who = f.read(120).decode("utf-8", "replace").strip()
+        f.close()
+        raise SystemExit(
+            f"FATAL: another HCSC pull already holds {out}"
+            + (f"\n  holder: {who}" if who else "")
+            + "\nTwo pullers would interleave writes into the same NDJSON files.")
+    f.seek(1)
+    f.write(f"pid {os.getpid()} started "
+            f"{datetime.now().isoformat(timespec='seconds')}".ljust(120).encode())
+    f.flush()
+    _DIR_LOCK = f
+
+
 CHECKPOINT_EVERY = 20          # pages; ~1 min of walking at the measured 2.7s
 
 
@@ -256,6 +298,7 @@ def main() -> int:
 
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    lock_out_dir(out)
     H = {"client_id": client_id(), "Accept": "application/fhir+json"}
     resources = [r.strip() for r in a.resources.split(",") if r.strip()]
 
@@ -393,9 +436,27 @@ def main() -> int:
                 pct = 100.0 * got / srv
                 flag = "COMPLETE" if got >= srv else f"SHORT by {srv-got:,}"
                 print(f"  {res:24s} {got:>10,} / {srv:>10,}  ({pct:5.1f}%)  {flag}")
+                summary[res] = {"collected": got, "server_total": srv,
+                                "complete": got >= srv}
             else:
                 print(f"  {res:24s} {got:>10,} / server total unavailable")
+                summary[res] = {"collected": got, "server_total": None,
+                                "complete": False}
             sinks[res].close()
+
+    # A completion marker, so the watchdog trigger stops relaunching once the
+    # pull is done. Without it every restart would re-read ~120GB of NDJSON to
+    # rebuild the dedup set before discovering there is nothing left to do.
+    # Only written when every requested resource reached its server total, so a
+    # short run stays restartable.
+    if summary and all(v["complete"] for v in summary.values()):
+        (out / "_complete.json").write_text(
+            json.dumps({"finished": datetime.now().isoformat(timespec="seconds"),
+                        "resources": summary}, indent=1), encoding="utf-8")
+        print("all requested resources complete -> _complete.json written", flush=True)
+    else:
+        short = [r for r, v in summary.items() if not v["complete"]]
+        print(f"still short on {', '.join(short)}; re-run to continue", flush=True)
     return 0
 
 
