@@ -424,6 +424,16 @@ def main() -> int:
         print(f"\n{len(discovered)} specialty code(s) found in the data but absent "
               f"from the published list -> _discovered_codes.txt", flush=True)
 
+    # A read is judged complete within DRIFT_TOLERANCE of the reported total,
+    # not at exactly the total. The directory is live and grows while we read
+    # it: Organization finished 22 records under a total that had moved from
+    # 422,050 to 422,072, and Practitioner 77 under. Demanding got >= total
+    # would mean a perfect read of a growing directory never counts as
+    # complete, the marker never gets written, and the watchdog relaunches for
+    # ever. 0.1% is far below any real gap (PractitionerRole's shortfall was
+    # 1.3%) and far above observed drift (0.005%).
+    DRIFT_TOLERANCE = 0.001
+    summary: dict[str, dict] = {}
     print("\n--- distinct ids collected ---", flush=True)
     with httpx.Client(headers=H, follow_redirects=True) as c:
         for res in resources:
@@ -434,14 +444,21 @@ def main() -> int:
                 srv = None
             if srv:
                 pct = 100.0 * got / srv
-                flag = "COMPLETE" if got >= srv else f"SHORT by {srv-got:,}"
+                short = srv - got
+                ok = got >= srv * (1 - DRIFT_TOLERANCE)
+                if got >= srv:
+                    flag = "COMPLETE"
+                elif ok:
+                    flag = f"COMPLETE (within drift, {short:,} under a moving total)"
+                else:
+                    flag = f"SHORT by {short:,}"
                 print(f"  {res:24s} {got:>10,} / {srv:>10,}  ({pct:5.1f}%)  {flag}")
                 summary[res] = {"collected": got, "server_total": srv,
-                                "complete": got >= srv}
+                                "shortfall": short, "complete": ok}
             else:
                 print(f"  {res:24s} {got:>10,} / server total unavailable")
                 summary[res] = {"collected": got, "server_total": None,
-                                "complete": False}
+                                "shortfall": None, "complete": False}
             sinks[res].close()
 
     # A completion marker, so the watchdog trigger stops relaunching once the
