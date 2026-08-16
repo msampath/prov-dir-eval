@@ -524,14 +524,25 @@ def main() -> int:
     # rebuild the dedup set before discovering there is nothing left to do.
     # Only written when every requested resource reached its server total, so a
     # short run stays restartable.
-    if summary and all(v["complete"] for v in summary.values()):
+    # The marker must mean "the whole directory is pulled", because the runner
+    # exits on sight of it. A run over a subset of resources cannot say that,
+    # however complete that subset is. A two-resource verification run wrote a
+    # marker claiming the pull was finished while PractitionerRole sat at 99.5%,
+    # which would have stopped the watchdog from ever resuming it.
+    covered_all = set(resources) == set(SERVED)
+    if summary and covered_all and all(v["complete"] for v in summary.values()):
         (out / "_complete.json").write_text(
             json.dumps({"finished": datetime.now().isoformat(timespec="seconds"),
                         "resources": summary}, indent=1), encoding="utf-8")
-        print("all requested resources complete -> _complete.json written", flush=True)
+        print("every resource complete -> _complete.json written", flush=True)
     else:
         short = [r for r, v in summary.items() if not v["complete"]]
-        print(f"still short on {', '.join(short)}; re-run to continue", flush=True)
+        if short:
+            print(f"still short on {', '.join(short)}; re-run to continue", flush=True)
+        if not covered_all:
+            missing = sorted(set(SERVED) - set(resources))
+            print(f"no completion marker: this run covered {len(resources)} of "
+                  f"{len(SERVED)} resources, omitting {', '.join(missing)}", flush=True)
     return 0
 
 
