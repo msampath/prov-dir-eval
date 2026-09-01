@@ -34,6 +34,9 @@ Thumbs.db
 # Bulk reference datasets (NPPES ~1.1GB) — downloaded, never committed
 data/
 
+# Downloaded tooling (HL7 validator_cli.jar, ~180MB — exceeds GitHub's file size limit)
+tools/
+
 # Analysis artifacts / draft specs / review transcripts — not code, not committed
 docs/evidence/
 docs/reviews/
