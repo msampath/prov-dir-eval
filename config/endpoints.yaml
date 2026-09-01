@@ -7,7 +7,13 @@
 # the CSV does not carry: auth strategy, the .env secret keys each endpoint
 # needs, known server quirks, and pagination limits.
 #
-# One entry per DISTINCT base URL. `brands` lists every payer the URL serves.
+# One entry per DISTINCT base URL, with ONE deliberate exception: the six
+# `*_new` keys in the PARALLEL RE-CAPTURE BLOCK at the end of this file
+# intentionally duplicate a parent entry's base_url for an independent,
+# from-empty capture used to measure completeness against the live API
+# (see that block's header comment for the full rationale and evidence).
+# They are not new payers; `brands: []` on each keeps brand totals honest.
+# `brands` otherwise lists every payer the URL serves.
 #
 # auth.strategy values map to provdir.auth strategies:
 #   none | client_id_header | client_id_secret_headers | api_key_header
@@ -1453,3 +1459,291 @@ endpoints:
       read_timeout: 120
       request_timeout: 300
       max_concurrency: 2
+
+  # ===== PARALLEL RE-CAPTURE BLOCK (2026-08-25) ==============================
+  # Six fresh-schema shadow captures of the six live Innovaccer PDex Plan-Net
+  # tenants (vermont_blue_advantage excluded: Innovaccer confirmed 2026-07-31
+  # it decommissioned that tenant; its schema is empty). Full investigation:
+  # C:\Users\Admin\.claude\plans\1-repull-azblue-and-delegated-conway.md,
+  # Track 1.
+  #
+  # WHY THIS EXISTS. The six parent entries below (bcbs_az, banner, wellmark,
+  # wellmark_advantage, next_blue_nd, plan_menonita) are loaded by an
+  # upsert-only pipeline that never deletes, so their Postgres schemas are a
+  # UNION over every run since 2026-06, not a snapshot of what the API serves
+  # today: banner.organization_affiliation held 1,632,262 rows against a live
+  # server total of 1,171,555 (139.3% coverage), and bcbs_az.organization was
+  # never captured completely by any single run -- a truncated file-sweep was
+  # recorded status=ok because the upsert loader counts the table, which
+  # already held rows from an earlier pull. These six keys are a from-empty,
+  # independently-checkpointed re-capture so completeness can be measured
+  # directly instead of inferred from a cumulative table. They are NOT new
+  # payers -- do not count them in payer/endpoint totals (brands: [] keeps
+  # total_brands unchanged), and see the retirement note at the end of this
+  # block.
+  #
+  # THE EVIDENCE (three rounds of live, read-only HTTP probing against these
+  # exact hosts, 2026-08-24/25 -- see plan Track 1 for the full request logs):
+  #
+  # 1. UNSORTED PAGINATION HAS NO STABLE ORDER ON THIS PLATFORM, so
+  #    base_params: {_sort: _id} below is REQUIRED, not a completeness
+  #    nicety. Fetching azblue Organization page=500 twice, 60s apart: only
+  #    282/1000 ids in common (718 differ each direction). Adjacent pages
+  #    (500 vs 501, same fetch) overlapped 339/1000 -- true pagination gives
+  #    0 overlap. A "walk until distinct-id count converges" fallback is
+  #    provably unsafe on this platform. Sorted results, where they return,
+  #    ARE correct: verified strictly-increasing, gapless, non-overlapping
+  #    across pages within the safe depth.
+  #
+  # 2. THE SORTED-PAGINATION DEPTH CEILING IS CELL-SPECIFIC, NOT PLATFORM-
+  #    WIDE. _sort=_id&_count=1000&page=10 (offset 9,000) succeeds
+  #    everywhere tested; page=11 (offset 10,000) hangs -- zero bytes back
+  #    within 40s, not even headers -- but ONLY on azblue Organization. The
+  #    same offset-10,000 test on bannerhealth-live OrganizationAffiliation,
+  #    azblue Location, and wellmark PractitionerRole all returned 200 (the
+  #    counter-example: banner OrganizationAffiliation later paged cleanly
+  #    all the way to offset ~1,170,000). The Gate 1 48-cell probe (this
+  #    round) pushed every cell with T > 10,000 to page=10, page=11, AND a
+  #    genuine deep-with-data page (floor(T/1000)-1, confirmed NOT past the
+  #    end -- 1000 real entries every time) to rule out the "empty result
+  #    short-circuits the check" confound. Of 48 cells, exactly ONE hard-
+  #    walled: azblue Organization. One more, bannerhealth-live
+  #    OrganizationAffiliation (T=1,171,555), is merely slow at depth -- 21.0s
+  #    at a real deep page (1170) vs under 1.5s at page 10/11 -- well inside
+  #    the 120s/300s timeouts below; left as bare+_sort and flagged here as a
+  #    cell to watch, not pre-solved with speculative partitioning. Every
+  #    other cell, including several 300k-450k-row tenants (e.g. nextbluend
+  #    PractitionerRole 441,210; wellmark/wellmark_advantage Location
+  #    359,051), paged cleanly to a real deep page. T_sorted == T and the
+  #    two-page monotone check passed on all 48 cells -- _sort=_id never
+  #    corrupted the completeness denominator anywhere in this corpus.
+  #
+  # 3. azblue ORGANIZATION CEILING TRACES TO A SINGLE BULK-LOAD SECOND.
+  #    Binary-bisecting _lastUpdated on azblue Organization found the entire
+  #    lt2025-01-01 bucket (1,535,956 records, 82% of the table) collapses
+  #    into a handful of one-second windows around 2024-10-22T09:4[7-9]Z, one
+  #    of which alone holds 16,154 records -- already past the 10,000-row
+  #    ceiling by itself. Sub-second _lastUpdated filtering IS honored by
+  #    this server (verified: both halves and all four quarters of that
+  #    second were fetched independently and summed exactly back to the
+  #    parent, non-degenerately -- not silently truncated). The second splits
+  #    cleanly at the quarter-second boundary: [.000-.250)=8,083 and
+  #    [.750-1.000)=8,071 (the middle two quarters are empty), 8,083+8,071=
+  #    16,154 exactly. A second, independently-bisected 727,494-record
+  #    branch of the same day resolved to the same ~16,000-per-second shape
+  #    (16,118), corroborating the pattern but NOT proving it holds
+  #    throughout -- the full bisection tree (~9 major branches) was not
+  #    exhaustively walked, which is why bucket_max/min_window_seconds below
+  #    carry real margin rather than the exact numbers measured.
+  #
+  #    The 2024-01-01 start floor on Organization drops nothing:
+  #    _lastUpdated=lt2024-01-01&_summary=count == 0 and the earliest live
+  #    record is 2024-10-22. Kept because the operator confirmed it is fine.
+  #
+  #    The existing daterange sweep (extract.py: _daterange_sweep /
+  #    adaptive_extract) could not express this fix before today: _iso()
+  #    rendered every boundary at whole-second precision regardless of the
+  #    underlying datetime, and min_window was hardcoded to 1 second -- so a
+  #    16,000-record one-second leaf was structurally unsplittable and
+  #    overflowed silently into the page budget. This is the same mechanism
+  #    that made the OLD bcbs_az adaptive run (5-second windows, 23+ pages =
+  #    offset 23,000, past the ceiling) truncate at 1,463,451 of 1,862,183
+  #    while still being recorded status=ok. Both _iso() (now emits
+  #    millisecond precision only when the datetime has a nonzero fractional
+  #    second, else byte-identical to before) and min_window (now
+  #    float(cfg.get("min_window_seconds", 1)), default 1 -- unchanged for
+  #    every endpoint that does not set the key, i.e. humana:Practitioner and
+  #    capital_blue:PractitionerRole/OrganizationAffiliation) were fixed in
+  #    extract.py to make the quarter-second split above reachable. See
+  #    tests/test_daterange_sweep.py and tests/test_http_and_extract_units.py.
+  #
+  # 4. wellmark_advantage COUNT-MATCHES wellmark ON EVERY RESOURCE -- EVIDENCE
+  #    PENDING ROW-LEVEL CONFIRMATION, not a settled fact. All 8 Gate 1
+  #    resource counts are byte-identical between the two tenants:
+  #    Organization 205,771/205,771, Practitioner 234,925/234,925,
+  #    PractitionerRole 311,930/311,930, Location 359,051/359,051,
+  #    HealthcareService 6,761/6,761, OrganizationAffiliation 0/0,
+  #    InsurancePlan 9/9, Endpoint 0/0. An eight-way count match is
+  #    suggestive of one dataset behind two hostnames, but COUNT equality is
+  #    not ROW equality -- two distinct datasets could coincidentally match
+  #    on all 8 counts. The diff report (Track 1 Gate 5) is what actually
+  #    settles this, via a direct wellmark_new <-> wellmark_advantage_new
+  #    id/raw_hash comparison; expected NEW=0, VANISHED=0, CHANGED=0 on all 8
+  #    resources IF the hypothesis holds. Until that report exists, treat
+  #    this as an open question, not a conclusion.
+  #
+  # SIDE EFFECT ON PARENTS: _limiter_for (http_client.py) builds one rate
+  # limiter per HOST and takes the strictest politeness setting across every
+  # manifest entry on that host. Each entry below therefore also throttles
+  # its PARENT key (same hostname) to max_concurrency=2 /
+  # min_request_interval=0.25s. Intentional: none of the six parents
+  # currently carry politeness quirks, and all six hosts have a history of
+  # 500/502/503 under load.
+  #
+  # ACCEPTANCE NOTE: the partition-sum completeness proof (leaf counts
+  # summing exactly to the unfiltered total) is EXACT only for a resource
+  # that is not being written to during the walk. A live-mutating resource
+  # cannot give a perfectly consistent snapshot across sequential HTTP
+  # requests -- azblue Location three _lastUpdated year-buckets summed to
+  # 915,355 against an unfiltered total of 915,334 (21 more, buckets taken
+  # about 2s apart), almost certainly ordinary write drift, not a boundary
+  # bug (the same additivity check on the far more static Organization
+  # resource, including a deliberately overlapping pair, was exact to the
+  # record). This is inherent, not a bug the code needs to eliminate -- the
+  # acceptance band (coverage_pct 99.9-100.5%) exists to absorb it. Say this
+  # plainly in the write-up: the proof is exact for static resources,
+  # approximate for mutating ones.
+  #
+  # RETIREMENT: once the diff report (Track 1 Gate 5/6) is written up and
+  # reconciled against the parent schemas, drop these six schemas and delete
+  # this block. They are scaffolding for one investigation, not a permanent
+  # second copy of these payers.
+  - key: bcbs_az_new
+    payer_name: AZ Blue (Blue Cross Blue Shield of Arizona) [PARALLEL RE-CAPTURE]
+    parent_org: AZ Blue (on Innovaccer)
+    brands: []
+    base_url: https://azblue.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300
+      # Organization ONLY: the one cell of 48 probed that hard-walls at
+      # offset 10,000 under _sort=_id (see block header, evidence #2/#3).
+      # bucket_max: 8000, not 9000 -- the real ceiling is from+size <= 10000;
+      # an 8,000-row bucket at _count=1000 tops out at from=7000, leaving
+      # 3,000 rows of headroom instead of 0. min_window_seconds: 0.05, not
+      # the 0.25 actually measured to work -- that 0.25 was only proven on 2
+      # of roughly 9 major branches of the historical cluster; the other 7
+      # are unexplored and may be denser. 50ms gives the bisection room to
+      # keep going rather than truncating a bucket it cannot split; it only
+      # descends that far when a window is genuinely still oversized, so it
+      # costs nothing on branches that already resolve at a coarser level.
+      # All 7 other resources on this tenant passed Gate 1 clean (bare+_sort,
+      # no ceiling hit) and get none of this.
+      adaptive:
+        Organization: {param: _lastUpdated, mode: daterange, start: "2024-01-01", bucket_max: 8000, min_window_seconds: 0.05}
+
+  - key: banner_new
+    payer_name: Banner Health [PARALLEL RE-CAPTURE]
+    parent_org: Banner Health (payvider, via Innovaccer)
+    brands: []
+    base_url: https://bannerhealth-live.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300
+      next_link_replace: ["/fhirwrapper/", "/fhir/"]
+      # OrganizationAffiliation (T=1,171,555) passed Gate 1 with no hard
+      # wall but IS slow at depth: 21.0s at a genuine deep page (page 1170,
+      # near the true end) vs under 1.5s at page 10/11. Comfortably inside
+      # the 120s/300s timeouts above -- for now: that 21.0s is a SINGLE
+      # measurement, taken 2026-08-25 with no concurrent load on the host
+      # (this tenant was the only one being probed at the time), against a
+      # server with a recorded history of 500/502/503 under load. It has not
+      # been re-measured under the actual pull conditions (six tenants
+      # sequential, but this host is also shared with the still-active
+      # banner parent key). Left as plain bare+_sort deliberately -- adding
+      # a partition scheme to a cell that demonstrably works on one sample is
+      # speculative complexity. Flagged here as a cell to watch during the
+      # actual pull -- if it approaches the 120s read_timeout under real
+      # conditions, that is new information, not a problem pre-solved on
+      # untested assumptions.
+
+  - key: wellmark_new
+    payer_name: Wellmark (BCBS Iowa / South Dakota) [PARALLEL RE-CAPTURE]
+    parent_org: Wellmark
+    brands: []
+    base_url: https://wellmark.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300
+
+  - key: wellmark_advantage_new
+    payer_name: Wellmark Advantage Health Plan [PARALLEL RE-CAPTURE]
+    parent_org: Wellmark
+    brands: []
+    # Distinct tenant/hostname from wellmark_new. Gate 1 (2026-08-25) found
+    # every one of 8 RESOURCE-LEVEL COUNTS byte-identical between the two
+    # (block header, evidence #4) -- an eight-way match, which is suggestive
+    # but is COUNT equality, not row equality. This is EVIDENCE PENDING
+    # ROW-LEVEL CONFIRMATION, not a settled fact: two distinct datasets could
+    # coincidentally match on all 8 counts and still differ record-by-record.
+    # The diff report (Track 1 Gate 5) is what actually settles this, via a
+    # direct wellmark_new <-> wellmark_advantage_new id/raw_hash comparison
+    # (expected NEW=0, VANISHED=0, CHANGED=0 on all 8 resources if the
+    # hypothesis holds). Do not treat this tenant as a known duplicate before
+    # that report exists.
+    base_url: https://wellmarkadvantagehealthplan.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300
+
+  - key: next_blue_nd_new
+    payer_name: Next Blue of North Dakota (BCBS ND) [PARALLEL RE-CAPTURE]
+    parent_org: Blue Cross Blue Shield of North Dakota
+    brands: []
+    base_url: https://nextbluend.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300
+
+  - key: plan_menonita_new
+    payer_name: Plan de Salud Menonita (PR) [PARALLEL RE-CAPTURE]
+    parent_org: Plan de Salud Menonita
+    brands: []
+    base_url: https://planmenonita.innovaccer.com/fhir/davinci_pdex_plan_net
+    status: unknown
+    mvp: false
+    auth:
+      strategy: none
+    quirks:
+      no_metadata: true
+      page_size: 1000
+      base_params: {_sort: _id}
+      max_concurrency: 2
+      min_request_interval: 0.25
+      read_timeout: 120
+      request_timeout: 300

@@ -33,3 +33,8 @@ Thumbs.db
 
 # Bulk reference datasets (NPPES ~1.1GB) — downloaded, never committed
 data/
+
+# Analysis artifacts / draft specs / review transcripts — not code, not committed
+docs/evidence/
+docs/reviews/
+docs/evaluation-framework.md

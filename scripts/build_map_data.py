@@ -23,6 +23,9 @@ sys.path.insert(0, str(REPO / "src"))
 
 from provdir.config import load_manifest          # noqa: E402
 from provdir.db import get_engine                 # noqa: E402
+from provdir.quality.conformance import (         # noqa: E402
+    D3_UNIT, D3_UNIT_CAVEAT, cell_mean_rate, parse_expect_payers, select_run,
+)
 from sqlalchemy import text                       # noqa: E402
 
 RESOURCES = ["Practitioner", "PractitionerRole", "Organization", "Location",
@@ -99,29 +102,23 @@ def geocoded(conn, payer: str) -> tuple[int, int]:
     return int(r[0]), int(r[1])
 
 
-def pick_conformance_run(conn) -> tuple[int, str]:
-    """Finished run holding the most validated instances.
-
-    Neither "newest" nor "complete" is the right rule on its own. `finished_at`
-    is stamped even when most chunks crashed (run 3: 50,974 of 118,718), and a
-    strict planned==recorded test picks the 90-instance pilot over run 2's
-    117,387, because oversize chunks time out in every full run. Most instances
-    wins, and the shortfall is reported rather than hidden.
-    """
-    rows = list(conn.execute(text(
-        "select r.run_id, r.instances, count(i.*) recorded "
-        "from conformance_run r left join conformance_instance i on i.run_id=r.run_id "
-        "where r.finished_at is not null group by 1,2")))
-    if not rows:
-        raise SystemExit("no finished conformance run to report on")
-    run_id, planned, recorded = max(rows, key=lambda r: r[2])
-    if planned and recorded < planned:
-        pct = 100.0 * recorded / planned
-        return int(run_id), f"{recorded:,} of {planned:,} instances ({pct:.1f}%)"
-    return int(run_id), f"complete ({recorded:,} instances)"
-
-
 def conformance(conn, run_id: int) -> dict[str, dict]:
+    """Per-payer conformance at the DECLARED unit, with the pooled figure beside it.
+
+    This used to emit ONLY the pooled counts (`p["validated"] += tot` across
+    every cell), which is the defect the framework named as "the sampling
+    design leaking into the headline". With Organization at 59% of rows and
+    PractitionerRole at 143.8 issues/instance against Location's 2.1, a pooled
+    rate is the biggest cell's rate diluted by row count: it moves when the
+    sample shape moves even if no payer changed.
+
+    `rate` is the declared unit -- the unweighted mean over this payer's
+    (payer, resource) cells, from the same helper conformance_report.py and
+    build_framework_payload.py use, so all three artifacts compute one number
+    one way. `validated`/`clean` remain, unchanged in meaning, because
+    build_map_artifact.py still divides them; they are the POOLED counts and
+    are labelled as such in the document's `conformance_unit` note.
+    """
     out: dict[str, dict] = {}
     for payer, cell, tot, clean in conn.execute(text(
             "select payer_id, split_part(cell,'__',1) c, count(*), "
@@ -133,6 +130,14 @@ def conformance(conn, run_id: int) -> dict[str, dict]:
         b = p["by_resource"].setdefault(cell, {"validated": 0, "clean": 0})
         b["validated"] += int(tot)
         b["clean"] += int(clean)
+    for p in out.values():
+        rate, used, suppressed = cell_mean_rate(
+            [(b["validated"], b["clean"]) for b in p["by_resource"].values()])
+        p["rate"] = rate
+        p["unit"] = D3_UNIT
+        p["cells_used"] = used
+        p["cells_suppressed"] = suppressed
+        p["pooled_rate"] = (p["clean"] / p["validated"]) if p["validated"] else None
     return out
 
 
@@ -178,7 +183,20 @@ def coverage(conn, run_id: int) -> dict[str, dict]:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--conformance-run", type=int, default=None,
-                    help="defaults to the newest finished run")
+                    help="report on this run explicitly. Without it the run is "
+                         "chosen by the shared rule in provdir.quality."
+                         "conformance.choose_run, which REFUSES rather than "
+                         "guess when the widest payer set and the largest "
+                         "instance count are different runs -- the case that "
+                         "would otherwise swap this 61-payer map for a "
+                         "single-payer full-population run.")
+    ap.add_argument("--expect-payers", default=None, metavar="N|a,b,c",
+                    help="required payer count, or the exact comma-separated "
+                         "payer set. Same flag, same meaning, in "
+                         "conformance_report.py and build_framework_payload.py.")
+    ap.add_argument("--allow-unverified", action="store_true",
+                    help="accept a run that did not account for every instance "
+                         "it attempted. Say so in the write-up.")
     ap.add_argument("--binding-run", type=int, default=None)
     ap.add_argument("--coverage-run", type=int, default=None)
     ap.add_argument("--out", default=str(REPO / "output" / "quality" / "map_data.json"))
@@ -186,10 +204,10 @@ def main() -> int:
 
     eng = get_engine()
     with eng.connect() as c:
-        if a.conformance_run:
-            conf_run, conf_note = a.conformance_run, "pinned by --conformance-run"
-        else:
-            conf_run, conf_note = pick_conformance_run(c)
+        conf_run, conf_note = select_run(
+            c, run_id=a.conformance_run,
+            expect_payers=parse_expect_payers(a.expect_payers),
+            allow_unverified=a.allow_unverified)
         bind_run = a.binding_run or c.execute(text(
             "select max(run_id) from binding_check_run")).scalar()
         cov_run = a.coverage_run or c.execute(text(
@@ -247,6 +265,13 @@ def main() -> int:
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "runs": {"conformance": conf_run, "conformance_note": conf_note,
                  "conformance_tho": conf_tho,
+                 "conformance_sample": (notes or {}).get("sample"),
+                 "conformance_unit": D3_UNIT,
+                 "conformance_unit_caveat": D3_UNIT_CAVEAT,
+                 "conformance_pooled_note":
+                     "payer.conformance.validated/clean are POOLED instance "
+                     "counts, kept for build_map_artifact.py; the declared "
+                     "unit is payer.conformance.rate",
                  "binding": bind_run, "coverage": cov_run},
         "payers": payers,
     }

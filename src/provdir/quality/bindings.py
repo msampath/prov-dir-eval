@@ -59,7 +59,7 @@ DEFAULT_CACHE = Path("F:/fhir_cache/packages")
 # load order (plan-net is the profile source of truth; the others fill in
 # base FHIR / US Core value sets and code systems Plan-Net's bindings point
 # at, e.g. v2-0360 for Practitioner.qualification.code).
-PLAN_NET = ("hl7.fhir.us.davinci-pdex-plan-net", "1.1.0")
+PLAN_NET = ("hl7.fhir.us.davinci-pdex-plan-net", "1.2.0")
 R4_CORE = ("hl7.fhir.r4.core", "4.0.1")
 THO = ("hl7.terminology.r4", "6.5.0")
 # us.core's version is NOT hardcoded here -- it is read from plan-net's own

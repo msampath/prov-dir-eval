@@ -7,11 +7,13 @@ All tests are network-free (httpx.MockTransport) and DB-free.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import httpx
 import pytest
 
 from provdir.config import Endpoint, Settings
-from provdir.etl.extract import _next_url, _partitions, resolve_server_total
+from provdir.etl.extract import _iso, _next_url, _partitions, resolve_server_total
 from provdir.http_client import FhirClient, _host_limiters, _is_retryable
 from provdir.auth.strategies import NoAuth
 from provdir.etl.transform import normalize_reference, transform_resource
@@ -160,3 +162,18 @@ def test_normalize_reference_forms():
     assert normalize_reference({"reference": "Practitioner/123"}) == "Practitioner/123"
     assert normalize_reference({"reference": "https://h/fhir/Practitioner/123"}) == "Practitioner/123"
     assert normalize_reference(None) is None
+
+
+# --- _iso: sub-second rendering must not disturb the whole-second case -----
+def test_iso_whole_second_byte_identical_to_current_format():
+    """Every daterange endpoint configured today only ever produces whole-second
+    boundaries at rest; this must render exactly as before the fix."""
+    dt = datetime(2024, 10, 22, 9, 49, 8, tzinfo=timezone.utc)
+    assert _iso(dt) == "2024-10-22T09:49:08Z"
+
+
+def test_iso_sub_second_renders_milliseconds():
+    """A dt with a fractional second (needed for sub-second bisection) now
+    renders instead of being silently floored to the enclosing whole second."""
+    dt = datetime(2024, 10, 22, 9, 49, 8, 250000, tzinfo=timezone.utc)
+    assert _iso(dt) == "2024-10-22T09:49:08.250Z"

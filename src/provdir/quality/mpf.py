@@ -229,6 +229,11 @@ MA_OVERRIDE_INCLUDE: dict[str, str] = {
             "Medicare business, closed 2025)",
     "western_health": "public-record override: Western Health Advantage "
                       "sells MA (CA)",
+    "bcbs_az_new": "public-record override: AZ Blue sells MA (BlueJourney / "
+                   "Blue MA products); the captured directory carries "
+                   "'MA BLUEVISTA PIMA HMO' / 'MA BLUEINSPIRE MARIOCPA PIMA "
+                   "PPO' network names, which use the bare 'MA ' abbreviation "
+                   "no signal regex matches",
 }
 MA_OVERRIDE_EXCLUDE: dict[str, str] = {}
 

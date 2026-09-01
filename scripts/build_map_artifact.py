@@ -169,6 +169,11 @@ def build(data: dict) -> str:
     tho = runs.get("conformance_tho")
     tho_chip = (f'<span class="chip">terminology {tho}</span>' if tho
                 else '<span class="chip flag">no THO package: v2-0360 unresolved</span>')
+    # Render the IG version the run actually used. It was hardcoded "1.1.0" in two
+    # places and went stale the moment run 9 validated against 1.2.0 -- the same
+    # literal-in-prose failure that put three different element counts in one
+    # document. Never restate a version; read it from the run.
+    ig_ver = runs.get("conformance_ig_version") or runs.get("ig_version") or "(version unrecorded)"
 
     return f"""<title>Provider directory conformance map</title>
 <style>{CSS}</style>
@@ -176,7 +181,7 @@ def build(data: dict) -> str:
 <header class="top">
   <h1>CMS-9115-F provider directory: conformance and coverage</h1>
   <p class="sub">Da Vinci PDex Plan-Net directories from 64 US payers, extracted to Postgres and
-  validated against Plan-Net 1.1.0. Geography comes from <span class="mono">Location.address_state</span>;
+  validated against Plan-Net {ig_ver}. Geography comes from <span class="mono">Location.address_state</span>;
   quality comes from the HL7 validator and from exhaustive binding and element-coverage sweeps.</p>
   <div class="prov">
     <span class="chip">generated {gen} UTC</span>
@@ -252,11 +257,17 @@ def build(data: dict) -> str:
 </section>
 
 <footer>
-  <p><b>Reading the rates.</b> Structural conformance is the share of validated sample instances with
-  zero errors against Plan-Net 1.1.0. Binding conformance is row-weighted over the full population,
-  not a sample, and counts rows whose codes are members of the bound value set. Coverage rates
-  average only measurable required elements; elements our mapping cannot measure are reported
-  separately and never counted as zero.</p>
+  <p><b>Reading the rates.</b> Structural conformance is the <b>unweighted mean over (payer, resource)
+  cells</b> of the share of validated instances with zero errors, cells under 30 instances suppressed.
+  It is deliberately not pooled across resources: pooling lets whichever resource has the most rows set
+  the headline, which describes that resource rather than the payer. Binding conformance is row-weighted
+  over the full population, not a sample, and counts rows whose codes are members of the bound value set.
+  Coverage rates average only measurable required elements; elements our mapping cannot measure are
+  reported separately and never counted as zero.</p>
+  <p><b>What this is not.</b> None of these is a compliance rate. Structural conformance counts validator
+  errors against a profile; it says nothing about whether a listing is accurate, reachable, or useful to a
+  member. A run may also have had declared non-Plan-Net profiles removed before validation — where that
+  applies it is recorded with the run and stated beside the figure, because it raises the rate.</p>
   <p><b>Exact counts and estimates.</b> Location counts and everything derived from geography are
   exact, because that table is scanned in full to build the map. Counts marked <span class="mono">~</span>
   are Postgres planner estimates. An exact count of every resource is not affordable here:
@@ -282,8 +293,20 @@ const pct = v => v == null ? null : v * 100;
 const pf = v => v == null ? 'n/a' : (v * 100).toFixed(1) + '%';
 
 function confRate(p) {{
-  const c = p.conformance; if (!c || !c.validated) return null;
+  const c = p.conformance; if (!c) return null;
+  // Declared unit: unweighted mean over (payer, resource) cells, n < 30 suppressed.
+  // `rate` is that mean, written by build_map_data.py. Fall back to the pooled
+  // ratio ONLY for payloads written before the unit was declared -- pooling lets
+  // whichever resource has the most rows set the headline (Organization is 59% of
+  // bcbs_az_new), which is the defect the framework named as "the sampling design
+  // leaking into the headline".
+  if (c.rate != null) return c.rate;
+  if (!c.validated) return null;
   return c.clean / c.validated;
+}}
+function confIsPooled(p) {{
+  const c = p.conformance;
+  return !!(c && c.rate == null && c.validated);
 }}
 function bindRate(p) {{
   const b = p.bindings; if (!b) return null;

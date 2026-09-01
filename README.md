@@ -57,11 +57,23 @@ src/provdir/
     specialties.py     # NUCC specialty ValueSet (671 codes) for the role sweep
   quality/
     collection_status.py  # acquisition dashboard (row counts + measured coverage)
+    conformance.py        # run selection, category rollups, binding-failure/system-inventory queries
+    bindings.py            # offline exhaustive ValueSet-binding checker (code-only membership)
+    findings.py             # groups raw conformance_issue rows into (resource_type, element_path,
+                             #   message_id, severity) findings; FHIRPath-expression normalizer +
+                             #   Track-A/Track-B (population vs. validator) element unification
+    mpf.py                  # Medicare Plan Finder / CMS TIG readiness checks
     ...                   # completeness, integrity, scoring, evaluation dashboard
 config/endpoints.yaml  # the endpoint manifest — source of truth for every payer
 scripts/
   orchestrate.py       # deterministic monthly re-pull: host-lane scheduling + stall watchdog
   bulk_ingest.py       # pull a resource via FHIR Bulk Data $export (servers that support it)
+  validate_conformance.py  # run the HL7 validator_cli against a payer's landed resources
+  sample_for_validation.py # draw a validator sample from a payer schema
+  conformance_report.py    # per-payer conformance/gap summary (text + JSON) for a chosen run
+  ig_elements.py, ig_closure.py, ig_audit_report.py  # Plan-Net IG element closure + Track-A
+                                                       #   (population-completeness) audit
+  audit_plannet.py          # element-level Plan-Net audit driver
 migrations/            # Alembic
 output/, reference/    # generated artifacts + auto-fetched IG (git-ignored)
 ```
@@ -143,6 +155,9 @@ All commands are `python -m provdir.cli <command>` (or the `provdir` console scr
 | `provdir coverage` | per-(payer, resource) landed-vs-server_total scoreboard |
 | `provdir status-dashboard` | acquisition dashboard → `output/collection_status.{html,json,_widget.html}` |
 | `provdir quality` | IG conformance + referential integrity per payer |
+| `python scripts/validate_conformance.py --payer P` | run validator_cli against a payer's resources → `conformance_run`/`conformance_issue` rows |
+| `python scripts/conformance_report.py --conformance-run N` | per-payer conformance/gap summary for one run |
+| `python scripts/ig_audit_report.py --audit-run N` | Track-A population-completeness audit vs. the Plan-Net element closure |
 | `provdir score` | composite `data_quality_score` |
 | `provdir dashboard` | evaluation site → `output/site/index.html` |
 | `provdir db check` | server version + schema list |

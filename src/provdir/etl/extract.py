@@ -449,7 +449,28 @@ async def _count_query(
 
 
 def _iso(dt: datetime) -> str:
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dt = dt.astimezone(timezone.utc)
+    if dt.microsecond:
+        # Sub-second bisection needs this precision to be expressible at all;
+        # whole-second datetimes (every value in use before this) are unaffected.
+        return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _quantize_midpoint(s: datetime, e: datetime, mid: datetime) -> datetime:
+    """Snap a bisection midpoint to the enclosing whole second.
+
+    Skips the snap if it would collapse the split — `whole` landing on `s` or
+    `e` would leave one child empty (zero-width) and the other identical to
+    the parent, looping forever. Provably unreachable in `_daterange_sweep`
+    itself: it only calls this once `s`/`e` are already whole seconds and the
+    window is splittable (width > 1s), and the smallest such integer width is
+    2s, for which floor(mid) always lands strictly inside (s, e). Kept here,
+    and exercised directly by tests, as the actual safety net for any input
+    that doesn't hold that invariant.
+    """
+    whole = mid.replace(microsecond=0)
+    return whole if s < whole < e else mid
 
 
 def _parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -481,16 +502,33 @@ async def _daterange_sweep(
     `blind_split_floor_days` — fetching a decades-wide window bare would just
     re-trip the server's per-search cap. Closed/exhaustive over timestamped
     records. Caveat: if more than bucket_max records share an identical
-    timestamp, a 1-second window can't split — those overflow to page-budget and
-    are surfaced by coverage reconciliation.
+    timestamp down to `min_window_seconds` (default 1s; set below 1, e.g. 0.25,
+    via cfg for servers that bulk-load many records within one calendar second —
+    confirmed on azblue Organization, where a single second held 16,154 records),
+    that window can't split further — those overflow to page-budget and are
+    surfaced by coverage reconciliation.
     """
     from datetime import timedelta
 
     start = _parse_dt(cfg.get("start")) or datetime(2000, 1, 1, tzinfo=timezone.utc)
     end = _parse_dt(cfg.get("end")) or (datetime.now(timezone.utc) + timedelta(days=1))
     max_depth = int(cfg.get("max_depth", 48))
-    min_window = timedelta(seconds=1)
+    min_window = timedelta(seconds=float(cfg.get("min_window_seconds", 1)))
     blind_floor = timedelta(days=float(cfg.get("blind_split_floor_days", 30)))
+
+    sub_second = min_window < timedelta(seconds=1)
+    if not sub_second:
+        # `end` defaults to datetime.now(UTC), which carries microseconds. That
+        # value is inherited UNCHANGED down the entire right-hand spine of the
+        # tree (every right child keeps its parent's `e`) all the way to a leaf
+        # — so without this, the most-recent-data bucket would get a fractional
+        # _lastUpdated bound on every single sweep, regardless of how carefully
+        # the recursive midpoint below is quantized. Round outward (start down,
+        # end up) so the swept range only ever WIDENS, never drops a record.
+        if start.microsecond:
+            start = start.replace(microsecond=0)
+        if end.microsecond:
+            end = end.replace(microsecond=0) + timedelta(seconds=1)
 
     stack = [(start, end, 0)]
     while stack:
@@ -505,6 +543,15 @@ async def _daterange_sweep(
         blind = cnt is None and (e - s) > blind_floor
         if splittable and (oversized or blind):
             mid = s + (e - s) / 2
+            if not sub_second:
+                # Whole-second boundaries unless the endpoint explicitly opts
+                # into sub-second bisection (min_window_seconds < 1). _iso()
+                # used to floor these on render; keeping the quantization here
+                # makes existing daterange payers (humana, capital_blue, the
+                # parent bcbs_az entry) byte-identical by construction rather
+                # than by accident. See _quantize_midpoint for the collapse
+                # guard and why it is provably a no-op on this call path.
+                mid = _quantize_midpoint(s, e, mid)
             stack.append((s, mid, depth + 1))
             stack.append((mid, e, depth + 1))
             stats["subdivided"] += 1
