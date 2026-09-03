@@ -68,6 +68,7 @@ config/endpoints.yaml  # the endpoint manifest — source of truth for every pay
 scripts/
   orchestrate.py       # deterministic monthly re-pull: host-lane scheduling + stall watchdog
   bulk_ingest.py       # pull a resource via FHIR Bulk Data $export (servers that support it)
+  nppes_verify.py      # filter a bulk NPPES snapshot down to a payer's NPIs -> public.nppes_verify
   validate_conformance.py  # run the HL7 validator_cli against a payer's landed resources
   sample_for_validation.py # draw a validator sample from a payer schema
   conformance_report.py    # per-payer conformance/gap summary (text + JSON) for a chosen run
@@ -125,6 +126,18 @@ recorded as such), which is itself a data-fidelity signal.
 (registration / OAuth / API key). The vast majority ingested here are open or
 public-token.
 
+### NPPES ground truth
+
+A payer's `active` flag, entity type, and address are self-reported. `scripts/nppes_verify.py`
+gives an independent check against the federal NPI registry. It streams a bulk NPPES NPI Files
+snapshot (https://download.cms.gov/nppes/NPI_Files.html, the monthly file plus any weekly delta
+zips, latest file wins per NPI) straight out of the zips, keeps only rows whose NPI appears in
+the payer's Practitioner or Organization tables, and loads them into `public.nppes_verify`. A
+join then answers whether each NPI exists in the registry, whether it is currently deactivated,
+what entity type it is registered as, and which state its registered practice location is in,
+without relying on the payer's own status fields. The table is truncated on each run, so it
+holds one payer at a time.
+
 ## Setup
 
 Prereqs: Python 3.11+, localhost Postgres 14+ (tested on 18), outbound HTTPS.
@@ -151,6 +164,7 @@ All commands are `python -m provdir.cli <command>` (or the `provdir` console scr
 | `provdir etl [--subset a,b] [--resources R] [--upsert] [--resume] [--max-pages N]` | rows in Postgres + `output/etl_summary.json` |
 | `python scripts/orchestrate.py [--dry-run] [--status] [--no-skip]` | monthly re-pull across all payers, one sequential lane per host, stall-killed units auto-retried |
 | `python scripts/bulk_ingest.py --payer P --type R` | load one resource via FHIR Bulk Data `$export` |
+| `python scripts/nppes_verify.py --schema S --monthly Z [--weekly Z ...]` | NPPES registry rows for every NPI in schema S → `public.nppes_verify` |
 | `provdir harvest --subset <payer>` | reference-graph (`_include`) role sweep for a big directory |
 | `provdir coverage` | per-(payer, resource) landed-vs-server_total scoreboard |
 | `provdir status-dashboard` | acquisition dashboard → `output/collection_status.{html,json,_widget.html}` |
