@@ -30,7 +30,7 @@ IG conformance, and referential integrity.
   can't.
 - **Evaluates** IG conformance and referential integrity on the landed data.
 
-Current snapshot: **~148M resources across 60 payer directories** (see
+Current snapshot: **1.3B+ FHIR resources across 65 payer directories** (see
 `/provdir-acquisition` dashboard / `provdir status-dashboard`). This grew from a
 7-payer, ~5.9M-row MVP; the phased build (scaffolding → conformance → schema → ETL →
 quality → score → dashboard) is complete, and the active focus has been maximizing
